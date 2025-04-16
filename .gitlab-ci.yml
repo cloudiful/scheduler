@@ -1,12 +1,30 @@
+stages:
+  - test
+  - publish
+
 test:
   stage: test
+  image: rust:latest
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo/
-  image: rust:latest
   tags:
     - docker
   script:
     - cargo test
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   cache:
-    paths:
-      - $CARGO_HOME
+    - paths:
+        - target/
+    - paths:
+        - $CARGO_HOME
+
+publish:
+  stage: publish
+  image: rust:latest
+  tags:
+    - docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - cargo publish --registry kellnr --token ${KELLNR_ACCESS_TOKEN}
