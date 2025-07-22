@@ -1,6 +1,4 @@
 use chrono::{DateTime, Local, Timelike};
-use log::info;
-use std::fmt::{Debug, Display};
 use std::time::Duration;
 use tokio::time;
 
@@ -25,7 +23,7 @@ struct History<R> {
 
 impl<R> Scheduler<R>
 where
-    R: Debug + Display + Clone,
+    R: Clone,
 {
     pub(crate) async fn execute<F, A>(&mut self, func: F, args: A) -> R
     where
@@ -33,8 +31,6 @@ where
     {
         let future = func(args);
         let result = future.await;
-
-        info!("Execute result: {}", &result);
 
         self.history.runtime.push(Local::now());
         self.history.results.push(result.clone());
@@ -46,7 +42,6 @@ where
     where
         F: AsyncFn(A) -> R,
         A: Clone,
-        R: Debug + Display,
     {
         let mut interval;
         match self.plan.interval {
