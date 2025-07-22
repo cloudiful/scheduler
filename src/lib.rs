@@ -1,18 +1,32 @@
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Local, NaiveDate, NaiveTime, Timelike};
 use std::time::Duration;
 use tokio::time;
 
 #[derive(Default)]
 pub struct Scheduler<R> {
+    current_id: i32,
     pub plan: Plan,
     history: History<R>,
 }
 
-#[derive(Default)]
 pub struct Plan {
     pub interval: Option<Duration>,
     pub date_time: Option<DateTime<Local>>,
+    pub date: Option<NaiveDate>,
+    pub time: Option<NaiveTime>,
     pub count: Option<usize>,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Plan {
+            interval: Some(Duration::from_millis(100)),
+            date_time: None,
+            date: None,
+            time: None,
+            count: Some(1),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -29,11 +43,16 @@ where
     where
         F: AsyncFnOnce(A) -> R,
     {
+        self.current_id += 1;
+        log::info!("Executing task {}", self.current_id);
+
         let future = func(args);
         let result = future.await;
 
         self.history.runtime.push(Local::now());
         self.history.results.push(result.clone());
+
+        log::info!("Finished task {}", self.current_id);
 
         result
     }
@@ -92,7 +111,6 @@ mod test {
     async fn datetime_once() {
         let mut scheduler = Scheduler::default();
         scheduler.plan.date_time = Some(Local::now());
-        scheduler.plan.count = Some(1);
         let result = scheduler.run(add, 1).await;
         assert_eq!(result, vec!["result, 2!"]);
     }
