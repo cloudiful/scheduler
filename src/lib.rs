@@ -1,6 +1,5 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, Timelike};
+use chrono::{DateTime, Local};
 use std::time::Duration;
-use tokio::time;
 
 #[derive(Default)]
 pub struct Scheduler<R> {
@@ -11,20 +10,16 @@ pub struct Scheduler<R> {
 
 pub struct Plan {
     pub interval: Option<Duration>,
-    pub date_time: Option<DateTime<Local>>,
-    pub date: Option<NaiveDate>,
-    pub time: Option<NaiveTime>,
-    pub count: Option<usize>,
+    pub date_times: Option<Vec<DateTime<Local>>>,
+    pub count: Option<i32>,
 }
 
 impl Default for Plan {
     fn default() -> Self {
         Plan {
-            interval: Some(Duration::from_millis(100)),
-            date_time: None,
-            date: None,
-            time: None,
-            count: Some(1),
+            interval: None,
+            date_times: None,
+            count: None,
         }
     }
 }
@@ -62,65 +57,111 @@ where
         F: AsyncFn(A) -> R,
         A: Clone,
     {
-        let mut interval;
-        match self.plan.interval {
-            None => {
-                interval = time::interval(Duration::from_millis(1000));
-            }
-            Some(duration) => {
-                interval = time::interval(duration);
-            }
+        let mut duration;
+        if let Some(value) = self.plan.interval {
+            duration = value;
+        } else {
+            duration = Duration::from_secs(1);
+        }
+
+        let mut count = self.plan.count;
+        if let Some(value) = &self.plan.date_times {
+            count = Some(value.len() as i32);
         }
 
         loop {
-            interval.tick().await;
-
-            if self.skip() {
-                continue;
-            }
-
             self.execute(&func, args.clone()).await;
 
-            if self.plan.count == Some(self.history.runtime.len()) {
-                return self.history.results.clone();
+            if let Some(calculated) = self.calculate_interval() {
+                duration = calculated
             }
+
+            if let Some(value) = count {
+                if value <= self.current_id {
+                    return self.history.results.clone();
+                }
+            }
+
+            tokio::time::sleep(duration).await;
         }
     }
 
-    fn skip(&self) -> bool {
-        if self.plan.date_time.is_none() {
-            return false;
+    fn calculate_interval(&mut self) -> Option<Duration> {
+        let date_times;
+        let date_time;
+
+        if let Some(value) = &self.plan.date_times {
+            date_times = value;
+        } else {
+            return None;
+        }
+
+        if let Some(value) = date_times.get((self.current_id - 1) as usize) {
+            date_time = value;
+        } else {
+            return None;
         }
 
         let now = Local::now();
-        now.hour() == self.plan.date_time.unwrap().hour()
-            && now.minute() == self.plan.date_time.unwrap().minute()
-            && now.second() == self.plan.date_time.unwrap().second()
+
+        let duration;
+        if let Ok(value) = (date_time.clone() - now).to_std() {
+            duration = value;
+        } else {
+            return None;
+        }
+
+        if let Some(value) = self.plan.interval {
+            if value < duration {
+                return None;
+            }
+        }
+
+        Some(duration)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use chrono::TimeDelta;
+    use std::ops::Add;
 
-    async fn add(num: i32) -> String {
-        format!("result, {}!", num + 1)
+    async fn add(num: i32) -> i32 {
+        num + 1
+    }
+
+    async fn print_test(args: Option<String>) -> Option<String> {
+        args
     }
 
     #[tokio::test]
-    async fn datetime_once() {
+    async fn duration_2() {
         let mut scheduler = Scheduler::default();
-        scheduler.plan.date_time = Some(Local::now());
+        scheduler.plan.interval = Some(Duration::from_secs(3));
+        scheduler.plan.count = Some(2);
+        let result = scheduler.run(print_test, None).await;
+        assert_eq!(result, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn date_times() {
+        let mut scheduler = Scheduler::default();
+        scheduler.plan.date_times = Some(vec![
+            Local::now().add(TimeDelta::seconds(1)),
+            Local::now().add(TimeDelta::seconds(3)),
+            Local::now().add(TimeDelta::seconds(5)),
+        ]);
         let result = scheduler.run(add, 1).await;
-        assert_eq!(result, vec!["result, 2!"]);
+        assert_eq!(result, vec![2, 2, 2]);
     }
 
     #[tokio::test]
     async fn interval_twice() {
         let mut scheduler = Scheduler::default();
-        scheduler.plan.interval = Some(Duration::from_secs(3));
+        scheduler.plan.interval = Some(Duration::from_secs(2));
         scheduler.plan.count = Some(3);
         let result = scheduler.run(add, 1).await;
-        assert_eq!(result, vec!["result, 2!", "result, 2!", "result, 2!"]);
+        assert_eq!(result, vec![2, 2, 2]);
     }
 }
