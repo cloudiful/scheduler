@@ -45,7 +45,7 @@ where
     pub async fn run<F, A>(&mut self, func: F, args: A) -> Vec<R>
     where
         F: AsyncFn(A) -> R,
-        A: Copy,
+        A: Clone,
         R: Debug + Display,
     {
         let mut interval;
@@ -65,7 +65,7 @@ where
                 continue;
             }
 
-            self.execute(&func, args).await;
+            self.execute(&func, args.clone()).await;
 
             if self.plan.count == Some(self.history.runtime.len()) {
                 return self.history.results.clone();
