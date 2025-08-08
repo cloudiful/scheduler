@@ -1,9 +1,9 @@
 [package]
 name = "scheduler"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
 chrono = {version = "0.4.41", features = ["serde"]}
-tokio = {version = "1.46.1", features = ["full"]}
+tokio = {version = "1.47.1", features = ["full"]}
 log = "0.4.27"
