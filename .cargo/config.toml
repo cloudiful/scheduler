@@ -1,7 +1,2 @@
-[source.crates-io]
-replace-with = "kellnr-cratesio"
-[source.kellnr-cratesio]
-registry = "sparse+https://kellnr.cloud1ful.com/api/v1/cratesio/"
-
 [registries.kellnr]
 index = "sparse+https://kellnr.cloud1ful.com/api/v1/crates/"
