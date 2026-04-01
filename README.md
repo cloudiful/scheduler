@@ -1,48 +1,112 @@
 # Scheduler
 
-Run async function at a planned schedule
+`scheduler` is a single-job async scheduling library for background ingestion tasks.
 
-## Usage
+Version `0.2.0` is a breaking refactor. The crate now exposes:
 
-### Add this package in Cargo.toml under [dependencies]
+- explicit schedules via `Schedule::Interval` or `Schedule::AtTimes`
+- missed-run handling via `MissedRunPolicy`
+- overlap control via `OverlapPolicy`
+- persistent job state via `StateStore`
+- bounded execution history via `SchedulerReport`
+
+The scheduler is responsible only for deciding when to trigger work. Domain-specific recovery, cursor logic, and idempotent refresh commands stay in the caller.
+
+## Add the crate
 
 ```toml
 [dependencies]
-scheduler = { git = "https://github.com/cloudiful/crates-scheduler.git" }
+scheduler = { git = "https://github.com/cloudiful/crates-scheduler.git", tag = "v0.2.0" }
+chrono = "0.4"
+chrono-tz = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
-For example I want to run this **add** function
+## Core concepts
+
+- `Scheduler::new(config, store)` creates the runtime.
+- `Job::new(job_id, schedule, task)` defines one scheduled task.
+- `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
+- `SchedulerHandle::cancel()` stops while waiting.
+- `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
+
+## Example: explicit Shanghai schedule
 
 ```rust
-async fn add(num: i32) -> String {
-  format!("result, {}!", num + 1)
+use chrono::{TimeDelta, Utc};
+use chrono_tz::Asia::Shanghai;
+use scheduler::{
+    InMemoryStateStore, Job, MissedRunPolicy, OverlapPolicy, Schedule, Scheduler,
+    SchedulerConfig,
+};
+
+#[tokio::main]
+async fn main() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+
+    let job = Job::new(
+        "refresh-a-shares",
+        Schedule::AtTimes(vec![
+            Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(5),
+            Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(10),
+        ]),
+        |_context| async move {
+            // Call your idempotent refresh command here.
+            Ok(())
+        },
+    )
+    .with_missed_run_policy(MissedRunPolicy::CatchUpOnce)
+    .with_overlap_policy(OverlapPolicy::Forbid);
+
+    let report = scheduler.run(job).await.unwrap();
+    println!("final state: {:?}", report.state);
+    println!("history length: {}", report.history.len());
 }
 ```
 
-### Create and configure a scheduler
+## Example: recover state across restarts
 
-#### Run now and only once
-```rust
-let mut scheduler = Scheduler::default();
-scheduler.plan.date_time = Some(Local::now());
-scheduler.plan.count = Some(1);
-
-```
-#### Run every 3 seconds for up to 3 times
+Share the same store instance across scheduler instances to resume from `next_run_at`.
 
 ```rust
-let mut scheduler = Scheduler::default();
-scheduler.plan.interval = Some(Duration::from_secs(3));
-scheduler.plan.count = Some(3);
+use std::sync::Arc;
+
+use chrono::{TimeDelta, Utc};
+use chrono_tz::Asia::Shanghai;
+use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig};
+
+#[tokio::main]
+async fn main() {
+    let store = Arc::new(InMemoryStateStore::new());
+
+    let scheduler = Scheduler::new(SchedulerConfig::default(), store.clone());
+    let job = Job::new(
+        "resume-me",
+        Schedule::AtTimes(vec![Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(30)]),
+        |_context| async move { Ok(()) },
+    );
+
+    let _ = scheduler.run(job).await;
+
+    let scheduler = Scheduler::new(SchedulerConfig::default(), store.clone());
+    let job = Job::new(
+        "resume-me",
+        Schedule::AtTimes(vec![Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(30)]),
+        |_context| async move { Ok(()) },
+    );
+
+    let _ = scheduler.run(job).await;
+}
 ```
 
-### Run
+## Scheduling semantics
 
-```rust
-// Get result vec
-let result = scheduler.run(add, 1).await;
-println!("{:?}", result)
-```
-
-The result should be a Vec containing results from every run.
-
+- `Schedule::AtTimes` never executes immediately on startup. The first run waits until the first planned time.
+- `Schedule::Interval` schedules the first run at `now + interval`.
+- `max_runs` applies only to interval schedules.
+- `MissedRunPolicy::Skip` drops missed occurrences and waits for the next future trigger.
+- `MissedRunPolicy::CatchUpOnce` runs one immediate compensating execution for missed occurrences.
+- `MissedRunPolicy::ReplayAll` replays each missed occurrence in schedule order.
+- `OverlapPolicy::Forbid` skips triggers while a run is active.
+- `OverlapPolicy::QueueOne` keeps at most one pending trigger while a run is active.
+- `OverlapPolicy::AllowParallel` spawns overlapping runs.
