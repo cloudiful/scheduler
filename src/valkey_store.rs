@@ -1,6 +1,8 @@
 use crate::model::JobState;
 use crate::store::StateStore;
 use redis::{AsyncCommands, Client, aio::ConnectionManager};
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 
 const DEFAULT_KEY_PREFIX: &str = "scheduler:valkey:job-state:";
 const LEGACY_DEFAULT_KEY_PREFIX: &str = "scheduler:job-state:";
@@ -52,13 +54,51 @@ fn state_key(prefix: &str, job_id: &str) -> String {
     format!("{prefix}{job_id}")
 }
 
+#[derive(Debug)]
+pub enum ValkeyStoreError {
+    Redis(redis::RedisError),
+    Codec(serde_json::Error),
+}
+
+impl Display for ValkeyStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ValkeyStoreError::Redis(error) => write!(f, "{error}"),
+            ValkeyStoreError::Codec(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for ValkeyStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ValkeyStoreError::Redis(error) => Some(error),
+            ValkeyStoreError::Codec(error) => Some(error),
+        }
+    }
+}
+
+impl From<redis::RedisError> for ValkeyStoreError {
+    fn from(error: redis::RedisError) -> Self {
+        Self::Redis(error)
+    }
+}
+
+impl From<serde_json::Error> for ValkeyStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Codec(error)
+    }
+}
+
 impl StateStore for ValkeyStateStore {
-    async fn load(&self, job_id: &str) -> Result<Option<JobState>, String> {
+    type Error = ValkeyStoreError;
+
+    async fn load(&self, job_id: &str) -> Result<Option<JobState>, Self::Error> {
         let mut connection = self.connection.clone();
         let payload: Option<String> = connection
             .get(self.state_key(job_id))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(ValkeyStoreError::from)?;
 
         let payload = match payload {
             Some(payload) => Some(payload),
@@ -67,7 +107,7 @@ impl StateStore for ValkeyStateStore {
                     connection
                         .get(legacy_key)
                         .await
-                        .map_err(|error| error.to_string())?
+                        .map_err(ValkeyStoreError::from)?
                 } else {
                     None
                 }
@@ -75,17 +115,17 @@ impl StateStore for ValkeyStateStore {
         };
 
         payload
-            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .map(|value| serde_json::from_str(&value).map_err(ValkeyStoreError::from))
             .transpose()
     }
 
-    async fn save(&self, state: &JobState) -> Result<(), String> {
+    async fn save(&self, state: &JobState) -> Result<(), Self::Error> {
         let mut connection = self.connection.clone();
-        let payload = serde_json::to_string(state).map_err(|error| error.to_string())?;
+        let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
         connection
             .set(self.state_key(&state.job_id), payload)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(ValkeyStoreError::from)
     }
 }
 

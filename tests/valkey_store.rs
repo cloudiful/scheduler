@@ -3,7 +3,7 @@
 use chrono::{TimeDelta, Utc};
 use redis::{AsyncCommands, Client};
 use scheduler::{
-    Job, JobState, Schedule, Scheduler, SchedulerConfig, StateStore, ValkeyStateStore,
+    Job, JobState, Schedule, Scheduler, SchedulerConfig, StateStore, Task, ValkeyStateStore,
 };
 use std::sync::{
     Arc,
@@ -129,10 +129,10 @@ async fn scheduler_restores_state_across_instances_using_valkey() {
         second_at.with_timezone(&chrono_tz::Asia::Shanghai),
     ];
 
-    let job = Job::new(
+    let job = Job::without_deps(
         job_id.clone(),
         Schedule::AtTimes(times.clone()),
-        move || {
+        Task::from_async(move |_| {
             let tx = tx.clone();
             let seen = seen.clone();
             async move {
@@ -141,7 +141,7 @@ async fn scheduler_restores_state_across_instances_using_valkey() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 Ok(())
             }
-        },
+        }),
     );
 
     let shutdown_handle = handle.clone();
@@ -162,13 +162,17 @@ async fn scheduler_restores_state_across_instances_using_valkey() {
             .expect("failed to reconnect to valkey"),
     );
     let seen = invocations.clone();
-    let job = Job::new(job_id.clone(), Schedule::AtTimes(times), move || {
-        let seen = seen.clone();
-        async move {
-            seen.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    });
+    let job = Job::without_deps(
+        job_id.clone(),
+        Schedule::AtTimes(times),
+        Task::from_async(move |_| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }),
+    );
 
     let second_report = scheduler_two.run(job).await.expect("second run failed");
 

@@ -20,15 +20,15 @@
 //! ```rust
 //! use std::time::Duration;
 //!
-//! use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig};
+//! use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task};
 //!
 //! let runtime = tokio::runtime::Runtime::new().unwrap();
 //! runtime.block_on(async {
 //!     let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
-//!     let job = Job::new(
+//!     let job = Job::without_deps(
 //!         "doc-simple",
 //!         Schedule::Interval(Duration::from_millis(1)),
-//!         || async { Ok(()) },
+//!         Task::from_async(|_| async { Ok(()) }),
 //!     )
 //!     .with_max_runs(1);
 //!
@@ -47,7 +47,7 @@ mod valkey_store;
 pub use error::SchedulerError;
 pub use model::{
     Job, JobFuture, JobResult, JobState, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord,
-    RunStatus, Schedule, SchedulerConfig, SchedulerReport, TaskContext, TaskHandler,
+    RunStatus, Schedule, SchedulerConfig, SchedulerReport, Task, TaskContext,
 };
 pub use scheduler::{Scheduler, SchedulerHandle};
 pub use store::{InMemoryStateStore, StateStore};

@@ -37,12 +37,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ## Core concepts
 
 - `Scheduler::new(config, store)` creates the runtime.
-- `Job::new(job_id, schedule, task)` defines an async task with no injected dependencies.
-- `Job::new_with_run(job_id, schedule, task)` defines a task that receives `RunContext`.
-- `Job::new_with(job_id, schedule, deps, task)` defines a task that receives injected `deps`.
-- `Job::new_with_context(job_id, schedule, deps, task)` defines a task that receives both `RunContext` and `deps` via `TaskContext`.
-- `Job::new_sync*` variants run lightweight synchronous work inline.
-- `Job::new_blocking*` variants run blocking synchronous work via `tokio::task::spawn_blocking`.
+- `Task::from_async(task)` defines an async task from the full `TaskContext`.
+- `Task::from_sync(task)` defines a lightweight synchronous task from the full `TaskContext`.
+- `Task::from_blocking(task)` defines a blocking synchronous task via `tokio::task::spawn_blocking`.
+- `Job::without_deps(job_id, schedule, task)` defines a task with no injected dependencies.
+- `Job::new(job_id, schedule, deps, task)` defines a task with explicit injected `deps`.
 - `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
 - `SchedulerHandle::cancel()` stops while waiting.
 - `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
@@ -54,19 +53,19 @@ Dependency injection in this crate is explicit: you pass a dependency value at j
 ```rust
 use std::time::Duration;
 
-use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig};
+use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task};
 
 #[tokio::main]
 async fn main() {
     let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
 
-    let job = Job::new(
+    let job = Job::without_deps(
         "refresh-cache",
         Schedule::Interval(Duration::from_secs(5)),
-        || async move {
+        Task::from_async(|_| async move {
             // Call your async command here.
             Ok(())
-        },
+        }),
     )
     .with_max_runs(1);
 
@@ -81,25 +80,25 @@ async fn main() {
 use chrono::{TimeDelta, Utc};
 use chrono_tz::Asia::Shanghai;
 use scheduler::{
-    InMemoryStateStore, Job, MissedRunPolicy, OverlapPolicy, RunContext, Schedule, Scheduler,
-    SchedulerConfig,
+    InMemoryStateStore, Job, MissedRunPolicy, OverlapPolicy, Schedule, Scheduler,
+    SchedulerConfig, Task,
 };
 
 #[tokio::main]
 async fn main() {
     let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
 
-    let job = Job::new_with_run(
+    let job = Job::without_deps(
         "refresh-a-shares",
         Schedule::AtTimes(vec![
             Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(5),
             Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(10),
         ]),
-        |context: RunContext| async move {
-            println!("scheduled for {}", context.scheduled_at);
+        Task::from_async(|context| async move {
+            println!("scheduled for {}", context.run.scheduled_at);
             // Call your idempotent refresh command here.
             Ok(())
-        },
+        }),
     )
     .with_missed_run_policy(MissedRunPolicy::CatchUpOnce)
     .with_overlap_policy(OverlapPolicy::Forbid);
@@ -117,7 +116,7 @@ Use `deps` to carry any number of business parameters as a struct or tuple.
 ```rust
 use std::sync::Arc;
 
-use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, TaskContext};
+use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task, TaskContext};
 
 #[derive(Debug)]
 struct RefreshDeps {
@@ -128,16 +127,16 @@ struct RefreshDeps {
 async fn main() {
     let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
 
-    let job = Job::new_with_context(
+    let job = Job::new(
         "refresh-market",
         Schedule::AtTimes(Vec::new()),
         RefreshDeps { market: "A-share" },
-        |context: TaskContext<RefreshDeps>| async move {
+        Task::from_async(|context: TaskContext<RefreshDeps>| async move {
             let deps: Arc<RefreshDeps> = context.deps.clone();
             println!("market: {}", deps.market);
             println!("scheduled for {}", context.run.scheduled_at);
             Ok(())
-        },
+        }),
     );
 
     let report = scheduler.run(job).await.unwrap();
@@ -154,26 +153,26 @@ use std::sync::Arc;
 
 use chrono::{TimeDelta, Utc};
 use chrono_tz::Asia::Shanghai;
-use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig};
+use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task};
 
 #[tokio::main]
 async fn main() {
     let store = Arc::new(InMemoryStateStore::new());
 
     let scheduler = Scheduler::new(SchedulerConfig::default(), store.clone());
-    let job = Job::new(
+    let job = Job::without_deps(
         "resume-me",
         Schedule::AtTimes(vec![Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(30)]),
-        || async move { Ok(()) },
+        Task::from_async(|_| async move { Ok(()) }),
     );
 
     let _ = scheduler.run(job).await;
 
     let scheduler = Scheduler::new(SchedulerConfig::default(), store.clone());
-    let job = Job::new(
+    let job = Job::without_deps(
         "resume-me",
         Schedule::AtTimes(vec![Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(30)]),
-        || async move { Ok(()) },
+        Task::from_async(|_| async move { Ok(()) }),
     );
 
     let _ = scheduler.run(job).await;
@@ -190,17 +189,17 @@ By default, keys are written under the `scheduler:valkey:job-state:` prefix. Loa
 ```rust
 use std::time::Duration;
 
-use scheduler::{Job, Schedule, Scheduler, SchedulerConfig, ValkeyStateStore};
+use scheduler::{Job, Schedule, Scheduler, SchedulerConfig, Task, ValkeyStateStore};
 
 #[tokio::main]
 async fn main() {
     let store = ValkeyStateStore::new("redis://127.0.0.1/").await.unwrap();
     let scheduler = Scheduler::new(SchedulerConfig::default(), store);
 
-    let job = Job::new(
+    let job = Job::without_deps(
         "refresh-cache",
         Schedule::Interval(Duration::from_secs(5)),
-        || async move { Ok(()) },
+        Task::from_async(|_| async move { Ok(()) }),
     )
     .with_max_runs(1);
 
