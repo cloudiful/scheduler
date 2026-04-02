@@ -41,6 +41,8 @@ mod error;
 mod model;
 mod scheduler;
 mod store;
+#[cfg(feature = "valkey-store")]
+mod valkey_store;
 
 pub use error::SchedulerError;
 pub use model::{
@@ -49,3 +51,5 @@ pub use model::{
 };
 pub use scheduler::{Scheduler, SchedulerHandle};
 pub use store::{InMemoryStateStore, StateStore};
+#[cfg(feature = "valkey-store")]
+pub use valkey_store::ValkeyStateStore;

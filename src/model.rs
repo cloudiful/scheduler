@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::{Asia::Shanghai, Tz};
+#[cfg(feature = "valkey-store")]
+use serde::{Deserialize, Serialize};
 use std::any::type_name;
 use std::collections::VecDeque;
 use std::future::{Future, ready};
@@ -460,6 +462,7 @@ pub struct RunRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "valkey-store", derive(Serialize, Deserialize))]
 pub struct JobState {
     pub job_id: String,
     pub trigger_count: u32,

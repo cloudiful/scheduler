@@ -10,6 +10,10 @@ Version `0.2.0` is a breaking refactor. The crate now exposes:
 - persistent job state via `StateStore`
 - bounded execution history via `SchedulerReport`
 
+Optional features:
+
+- `valkey-store` adds `ValkeyStateStore` for Valkey-backed state persistence.
+
 The scheduler is responsible only for deciding when to trigger work. Domain-specific recovery, cursor logic, and idempotent refresh commands stay in the caller.
 
 ## Add the crate
@@ -19,6 +23,14 @@ The scheduler is responsible only for deciding when to trigger work. Domain-spec
 scheduler = { git = "https://github.com/cloudiful/crates-scheduler.git", tag = "v0.2.0" }
 chrono = "0.4"
 chrono-tz = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+```
+
+Enable Valkey-backed state persistence:
+
+```toml
+[dependencies]
+scheduler = { git = "https://github.com/cloudiful/crates-scheduler.git", tag = "v0.2.0", features = ["valkey-store"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -167,6 +179,45 @@ async fn main() {
     let _ = scheduler.run(job).await;
 }
 ```
+
+## Example: Valkey-backed state
+
+This persists `JobState` in a single key per `job_id`. It improves restart recovery, but does not by itself provide distributed locking across multiple scheduler instances.
+
+The current Rust client still uses the `redis://` URI scheme for RESP servers, including Valkey.
+By default, keys are written under the `scheduler:valkey:job-state:` prefix. Loads also check the legacy `scheduler:job-state:` prefix so existing persisted state can still be resumed.
+
+```rust
+use std::time::Duration;
+
+use scheduler::{Job, Schedule, Scheduler, SchedulerConfig, ValkeyStateStore};
+
+#[tokio::main]
+async fn main() {
+    let store = ValkeyStateStore::new("redis://127.0.0.1/").await.unwrap();
+    let scheduler = Scheduler::new(SchedulerConfig::default(), store);
+
+    let job = Job::new(
+        "refresh-cache",
+        Schedule::Interval(Duration::from_secs(5)),
+        || async move { Ok(()) },
+    )
+    .with_max_runs(1);
+
+    let report = scheduler.run(job).await.unwrap();
+println!("next run: {:?}", report.state.next_run_at);
+}
+```
+
+## Integration test
+
+The Valkey integration tests are marked `ignored` so normal CI stays hermetic. Run them explicitly with a reachable server:
+
+```bash
+SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-store --test valkey_store -- --ignored
+```
+
+In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external Valkey integration test step in `.gitea/workflows/ci.yml`.
 
 ## Scheduling semantics
 

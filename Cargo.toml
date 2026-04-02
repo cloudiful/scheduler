@@ -3,7 +3,14 @@ name = "scheduler"
 version = "0.2.0"
 edition = "2024"
 
+[features]
+default = []
+valkey-store = ["dep:redis", "dep:serde", "dep:serde_json"]
+
 [dependencies]
 chrono = {version = "0.4.44", features = ["serde"]}
 chrono-tz = "0.10.4"
 tokio = { version = "1.50.0", features = [ "full" ] }
+redis = { version = "1.0.0", features = ["tokio-comp", "connection-manager"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
