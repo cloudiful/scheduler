@@ -22,16 +22,17 @@ impl<D> Task<D>
 where
     D: Send + Sync + 'static,
 {
+    fn from_handler(handler: TaskHandler<D>) -> Self {
+        Self { handler }
+    }
+
     /// Create an async task from the full [`TaskContext`].
     pub fn from_async<F, Fut>(task: F) -> Self
     where
         F: Fn(TaskContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = JobResult> + Send + 'static,
     {
-        let task = Arc::new(task);
-        Self {
-            handler: Arc::new(move |context| Box::pin((*task)(context))),
-        }
+        Self::from_handler(wrap_async_handler(Arc::new(task)))
     }
 
     /// Create a lightweight synchronous task from the full [`TaskContext`].
@@ -39,10 +40,7 @@ where
     where
         F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
     {
-        let task = Arc::new(task);
-        Self {
-            handler: Arc::new(move |context| Box::pin(ready((*task)(context)))),
-        }
+        Self::from_handler(wrap_sync_handler(Arc::new(task)))
     }
 
     /// Create a blocking synchronous task from the full [`TaskContext`].
@@ -50,13 +48,7 @@ where
     where
         F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
     {
-        let task = Arc::new(task);
-        Self {
-            handler: Arc::new(move |context| {
-                let task = task.clone();
-                Box::pin(async move { await_blocking(move || (*task)(context)).await })
-            }),
-        }
+        Self::from_handler(wrap_blocking_handler(Arc::new(task)))
     }
 }
 
@@ -94,13 +86,18 @@ where
 }
 
 impl<D> Job<D> {
+    fn default_policies() -> (MissedRunPolicy, OverlapPolicy) {
+        (MissedRunPolicy::CatchUpOnce, OverlapPolicy::Forbid)
+    }
+
     fn from_parts(job_id: String, schedule: Schedule, deps: Arc<D>, task: Task<D>) -> Self {
+        let (missed_run_policy, overlap_policy) = Self::default_policies();
         Self {
             job_id,
             schedule,
             max_runs: None,
-            missed_run_policy: MissedRunPolicy::CatchUpOnce,
-            overlap_policy: OverlapPolicy::Forbid,
+            missed_run_policy,
+            overlap_policy,
             task: task.handler,
             deps,
         }
@@ -137,6 +134,34 @@ impl<D> std::fmt::Debug for Job<D> {
             .field("deps", &type_name::<D>())
             .finish_non_exhaustive()
     }
+}
+
+fn wrap_async_handler<D, F, Fut>(task: Arc<F>) -> TaskHandler<D>
+where
+    D: Send + Sync + 'static,
+    F: Fn(TaskContext<D>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = JobResult> + Send + 'static,
+{
+    Arc::new(move |context| Box::pin((*task)(context)))
+}
+
+fn wrap_sync_handler<D, F>(task: Arc<F>) -> TaskHandler<D>
+where
+    D: Send + Sync + 'static,
+    F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
+{
+    Arc::new(move |context| Box::pin(ready((*task)(context))))
+}
+
+fn wrap_blocking_handler<D, F>(task: Arc<F>) -> TaskHandler<D>
+where
+    D: Send + Sync + 'static,
+    F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
+{
+    Arc::new(move |context| {
+        let task = task.clone();
+        Box::pin(async move { await_blocking(move || (*task)(context)).await })
+    })
 }
 
 #[derive(Debug, Clone)]

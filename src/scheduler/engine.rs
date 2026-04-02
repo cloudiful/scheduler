@@ -2,9 +2,9 @@ use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord, SchedulerConfig, SchedulerReport};
 use crate::scheduler::control::{ControlSignal, SchedulerHandle};
 use crate::scheduler::execution::{CompletedRun, spawn_trigger};
-use crate::scheduler::trigger::{
-    PendingTrigger, TriggerDecision, initial_next_run_at, next_run_is_in_future, next_trigger,
-};
+use crate::scheduler::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
+use crate::scheduler::trigger::{PendingTrigger, TriggerDecision, next_trigger};
+use crate::scheduler::trigger_math::{initial_next_run_at, next_run_is_in_future};
 use crate::store::StateStore;
 use chrono::Utc;
 use std::collections::VecDeque;
@@ -65,19 +65,14 @@ where
             }
 
             if matches!(*control_rx.borrow(), ControlSignal::Running) {
-                if active_count == 0
-                    && let Some(trigger) = queued_trigger.take()
-                {
+                if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
                     self.spawn_trigger(&job, &mut active, trigger);
                     active_count += 1;
                     continue;
                 }
 
                 let now = Utc::now();
-                if active_count > 0
-                    && matches!(job.missed_run_policy, crate::MissedRunPolicy::ReplayAll)
-                    && !matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
-                {
+                if self.should_wait_for_active_replay(&job, active_count) {
                     // ReplayAll preserves every missed occurrence; serialize it instead of
                     // letting overlap control drop overdue triggers while one run is active.
                 } else {
@@ -88,26 +83,18 @@ where
                         }
                         TriggerDecision::Trigger(trigger) => {
                             self.persist_state(&state).await?;
-                            match job.overlap_policy {
-                                crate::OverlapPolicy::AllowParallel => {
+                            match dispatch_trigger(
+                                job.overlap_policy,
+                                active_count,
+                                &mut queued_trigger,
+                                trigger,
+                            ) {
+                                OverlapAction::Spawn(trigger) => {
                                     self.spawn_trigger(&job, &mut active, trigger);
                                     active_count += 1;
                                     continue;
                                 }
-                                crate::OverlapPolicy::Forbid => {
-                                    if active_count == 0 {
-                                        self.spawn_trigger(&job, &mut active, trigger);
-                                        active_count += 1;
-                                    }
-                                    continue;
-                                }
-                                crate::OverlapPolicy::QueueOne => {
-                                    if active_count == 0 {
-                                        self.spawn_trigger(&job, &mut active, trigger);
-                                        active_count += 1;
-                                    } else if queued_trigger.is_none() {
-                                        queued_trigger = Some(trigger);
-                                    }
+                                OverlapAction::QueueUpdated | OverlapAction::Dropped => {
                                     continue;
                                 }
                             }
@@ -184,6 +171,12 @@ where
         completed.apply_to(state, history, self.config.history_limit);
         self.persist_state(state).await?;
         Ok(())
+    }
+
+    fn should_wait_for_active_replay<D>(&self, job: &Job<D>, active_count: usize) -> bool {
+        active_count > 0
+            && matches!(job.missed_run_policy, crate::MissedRunPolicy::ReplayAll)
+            && !matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
     }
 
     fn normalize_job<D>(&self, mut job: Job<D>) -> Result<Job<D>, SchedulerError> {
