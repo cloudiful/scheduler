@@ -1,10 +1,9 @@
 use crate::error::SchedulerError;
-use crate::model::{
-    Job, JobState, RunContext, RunRecord, RunStatus, SchedulerConfig, SchedulerReport, TaskContext,
-    push_history,
-};
+use crate::model::{Job, JobState, RunRecord, SchedulerConfig, SchedulerReport};
+use crate::scheduler::control::{ControlSignal, SchedulerHandle};
+use crate::scheduler::execution::{CompletedRun, spawn_trigger};
 use crate::scheduler::trigger::{
-    PendingTrigger, initial_next_run_at, next_run_is_in_future, next_trigger,
+    PendingTrigger, TriggerDecision, initial_next_run_at, next_run_is_in_future, next_trigger,
 };
 use crate::store::StateStore;
 use chrono::Utc;
@@ -12,28 +11,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlSignal {
-    Running,
-    Cancel,
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub struct SchedulerHandle {
-    control: watch::Sender<ControlSignal>,
-}
-
-impl SchedulerHandle {
-    pub fn cancel(&self) {
-        let _ = self.control.send(ControlSignal::Cancel);
-    }
-
-    pub fn shutdown(&self) {
-        let _ = self.control.send(ControlSignal::Shutdown);
-    }
-}
 
 #[derive(Debug)]
 pub struct Scheduler<S>
@@ -59,9 +36,7 @@ where
     }
 
     pub fn handle(&self) -> SchedulerHandle {
-        SchedulerHandle {
-            control: self.control.clone(),
-        }
+        SchedulerHandle::new(self.control.clone())
     }
 
     pub async fn run<D>(&self, job: Job<D>) -> Result<SchedulerReport, SchedulerError>
@@ -69,14 +44,16 @@ where
         D: Send + Sync + 'static,
     {
         let job = self.normalize_job(job)?;
-        let mut state = self.load_or_initialize_state(&job).await?;
+        let (mut state, state_is_new) = self.load_or_initialize_state(&job).await?;
         let mut history = VecDeque::new();
         let mut active = JoinSet::new();
         let mut active_count = 0usize;
         let mut queued_trigger = None;
         let _ = self.control.send(ControlSignal::Running);
         let mut control_rx = self.control.subscribe();
-        self.persist_state(&state).await?;
+        if state_is_new {
+            self.persist_state(&state).await?;
+        }
 
         loop {
             if matches!(
@@ -103,29 +80,37 @@ where
                 {
                     // ReplayAll preserves every missed occurrence; serialize it instead of
                     // letting overlap control drop overdue triggers while one run is active.
-                } else if let Some(trigger) = next_trigger(&job, &mut state, now)? {
-                    self.persist_state(&state).await?;
-                    match job.overlap_policy {
-                        crate::OverlapPolicy::AllowParallel => {
-                            self.spawn_trigger(&job, &mut active, trigger);
-                            active_count += 1;
-                            continue;
+                } else {
+                    match next_trigger(&job, &mut state, now)? {
+                        TriggerDecision::Idle => {}
+                        TriggerDecision::StateAdvanced => {
+                            self.persist_state(&state).await?;
                         }
-                        crate::OverlapPolicy::Forbid => {
-                            if active_count == 0 {
-                                self.spawn_trigger(&job, &mut active, trigger);
-                                active_count += 1;
+                        TriggerDecision::Trigger(trigger) => {
+                            self.persist_state(&state).await?;
+                            match job.overlap_policy {
+                                crate::OverlapPolicy::AllowParallel => {
+                                    self.spawn_trigger(&job, &mut active, trigger);
+                                    active_count += 1;
+                                    continue;
+                                }
+                                crate::OverlapPolicy::Forbid => {
+                                    if active_count == 0 {
+                                        self.spawn_trigger(&job, &mut active, trigger);
+                                        active_count += 1;
+                                    }
+                                    continue;
+                                }
+                                crate::OverlapPolicy::QueueOne => {
+                                    if active_count == 0 {
+                                        self.spawn_trigger(&job, &mut active, trigger);
+                                        active_count += 1;
+                                    } else if queued_trigger.is_none() {
+                                        queued_trigger = Some(trigger);
+                                    }
+                                    continue;
+                                }
                             }
-                            continue;
-                        }
-                        crate::OverlapPolicy::QueueOne => {
-                            if active_count == 0 {
-                                self.spawn_trigger(&job, &mut active, trigger);
-                                active_count += 1;
-                            } else if queued_trigger.is_none() {
-                                queued_trigger = Some(trigger);
-                            }
-                            continue;
                         }
                     }
                 }
@@ -165,7 +150,10 @@ where
         })
     }
 
-    async fn load_or_initialize_state<D>(&self, job: &Job<D>) -> Result<JobState, SchedulerError>
+    async fn load_or_initialize_state<D>(
+        &self,
+        job: &Job<D>,
+    ) -> Result<(JobState, bool), SchedulerError>
     where
         D: Send + Sync + 'static,
     {
@@ -175,8 +163,11 @@ where
             .await
             .map_err(SchedulerError::store)?
         {
-            Some(state) => Ok(state),
-            None => Ok(JobState::new(job.job_id.clone(), initial_next_run_at(job)?)),
+            Some(state) => Ok((state, false)),
+            None => Ok((
+                JobState::new(job.job_id.clone(), initial_next_run_at(job)?),
+                true,
+            )),
         }
     }
 
@@ -190,19 +181,8 @@ where
         history: &mut VecDeque<RunRecord>,
         completed: CompletedRun,
     ) -> Result<(), SchedulerError> {
-        state.last_run_at = Some(completed.record.started_at);
-        match completed.record.status {
-            RunStatus::Success => {
-                state.last_success_at = Some(completed.record.finished_at);
-                state.last_error = None;
-            }
-            RunStatus::Failed => {
-                state.last_error = completed.record.error.clone();
-            }
-        }
-
+        completed.apply_to(state, history, self.config.history_limit);
         self.persist_state(state).await?;
-        push_history(history, completed.record, self.config.history_limit);
         Ok(())
     }
 
@@ -231,40 +211,14 @@ where
     ) where
         D: Send + Sync + 'static,
     {
-        let task = job.task.clone();
-        let deps = job.deps.clone();
-        let timezone = self.config.timezone;
-        let job_id = job.job_id.clone();
-        active.spawn(async move {
-            let started_at = Utc::now();
-            let result = task(TaskContext {
-                run: RunContext {
-                    job_id,
-                    scheduled_at: trigger.scheduled_at,
-                    catch_up: trigger.catch_up,
-                    timezone,
-                },
-                deps,
-            })
-            .await;
-            let finished_at = Utc::now();
-
-            let (status, error) = match result {
-                Ok(()) => (RunStatus::Success, None),
-                Err(message) => (RunStatus::Failed, Some(message)),
-            };
-
-            CompletedRun {
-                record: RunRecord {
-                    scheduled_at: trigger.scheduled_at,
-                    started_at,
-                    finished_at,
-                    catch_up: trigger.catch_up,
-                    status,
-                    error,
-                },
-            }
-        });
+        spawn_trigger(
+            active,
+            job.task.clone(),
+            job.deps.clone(),
+            job.job_id.clone(),
+            self.config.timezone,
+            trigger,
+        );
     }
 
     async fn sleep_until_next(&self, next_run_at: Option<chrono::DateTime<Utc>>) {
@@ -277,9 +231,4 @@ where
             tokio::time::sleep(duration).await;
         }
     }
-}
-
-#[derive(Debug)]
-struct CompletedRun {
-    record: RunRecord,
 }

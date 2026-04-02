@@ -1,4 +1,7 @@
+mod control;
 mod engine;
+mod execution;
 mod trigger;
 
-pub use engine::{Scheduler, SchedulerHandle};
+pub use control::SchedulerHandle;
+pub use engine::Scheduler;
