@@ -1,7 +1,7 @@
 use crate::error::SchedulerError;
 use crate::model::{
     Job, JobState, RunContext, RunRecord, RunStatus, Schedule, SchedulerConfig, SchedulerReport,
-    push_history,
+    TaskContext, push_history,
 };
 use crate::store::StateStore;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -62,7 +62,10 @@ where
         }
     }
 
-    pub async fn run(&self, job: Job) -> Result<SchedulerReport, SchedulerError> {
+    pub async fn run<D>(&self, job: Job<D>) -> Result<SchedulerReport, SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         let job = self.normalize_job(job)?;
         let mut state = match self
             .store
@@ -201,7 +204,7 @@ where
         })
     }
 
-    fn normalize_job(&self, mut job: Job) -> Result<Job, SchedulerError> {
+    fn normalize_job<D>(&self, mut job: Job<D>) -> Result<Job<D>, SchedulerError> {
         match &mut job.schedule {
             Schedule::Interval(every) => {
                 if every.is_zero() {
@@ -218,7 +221,7 @@ where
         Ok(job)
     }
 
-    fn initial_next_run_at(&self, job: &Job) -> Option<DateTime<Utc>> {
+    fn initial_next_run_at<D>(&self, job: &Job<D>) -> Option<DateTime<Utc>> {
         if matches!(job.max_runs, Some(0)) {
             return None;
         }
@@ -231,12 +234,15 @@ where
         }
     }
 
-    fn next_trigger(
+    fn next_trigger<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         state: &mut JobState,
         now: DateTime<Utc>,
-    ) -> Result<Option<PendingTrigger>, SchedulerError> {
+    ) -> Result<Option<PendingTrigger>, SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         let Some(next_run_at) = state.next_run_at else {
             return Ok(None);
         };
@@ -282,12 +288,15 @@ where
         }
     }
 
-    fn collect_due_times(
+    fn collect_due_times<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         state: &JobState,
         now: DateTime<Utc>,
-    ) -> Result<Vec<DateTime<Utc>>, SchedulerError> {
+    ) -> Result<Vec<DateTime<Utc>>, SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         let mut due_times = Vec::new();
         let mut trigger_count = state.trigger_count;
         let mut next_run_at = state.next_run_at;
@@ -305,23 +314,29 @@ where
         Ok(due_times)
     }
 
-    fn advance_state_to(
+    fn advance_state_to<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         state: &mut JobState,
         scheduled_at: DateTime<Utc>,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<(), SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         state.trigger_count += 1;
         state.next_run_at = self.compute_next_after(job, scheduled_at, state.trigger_count)?;
         Ok(())
     }
 
-    fn advance_state_for(
+    fn advance_state_for<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         state: &mut JobState,
         due_times: &[DateTime<Utc>],
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<(), SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         for scheduled_at in due_times {
             self.advance_state_to(job, state, *scheduled_at)?;
         }
@@ -329,12 +344,15 @@ where
         Ok(())
     }
 
-    fn compute_next_after(
+    fn compute_next_after<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         scheduled_at: DateTime<Utc>,
         trigger_count: u32,
-    ) -> Result<Option<DateTime<Utc>>, SchedulerError> {
+    ) -> Result<Option<DateTime<Utc>>, SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         if let Some(max_runs) = job.max_runs
             && trigger_count >= max_runs
         {
@@ -356,22 +374,28 @@ where
         }
     }
 
-    fn spawn_trigger(
+    fn spawn_trigger<D>(
         &self,
-        job: &Job,
+        job: &Job<D>,
         active: &mut JoinSet<CompletedRun>,
         trigger: PendingTrigger,
-    ) {
+    ) where
+        D: Send + Sync + 'static,
+    {
         let task = job.task.clone();
+        let deps = job.deps.clone();
         let timezone = self.config.timezone;
         let job_id = job.job_id.clone();
         active.spawn(async move {
             let started_at = Utc::now();
-            let result = task(RunContext {
-                job_id,
-                scheduled_at: trigger.scheduled_at,
-                catch_up: trigger.catch_up,
-                timezone,
+            let result = task(TaskContext {
+                run: RunContext {
+                    job_id,
+                    scheduled_at: trigger.scheduled_at,
+                    catch_up: trigger.catch_up,
+                    timezone,
+                },
+                deps,
             })
             .await;
             let finished_at = Utc::now();
