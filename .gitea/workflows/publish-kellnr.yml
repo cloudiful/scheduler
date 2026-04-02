@@ -1,0 +1,29 @@
+name: Publish to Kellnr
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Publish crate to Kellnr
+        env:
+          KELLNR_TOKEN: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          if [ -z "$KELLNR_TOKEN" ]; then
+            echo "Missing secret: KELLNR_TOKEN"
+            exit 1
+          fi
+          cargo publish --locked --registry kellnr --token "$KELLNR_TOKEN"
