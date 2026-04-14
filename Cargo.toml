@@ -1,0 +1,33 @@
+[package]
+name = "cloudiful-scheduler"
+version = "0.3.3"
+edition = "2024"
+license = "Apache-2.0"
+description = "Single-job async scheduling library for background work with optional Valkey-backed state."
+readme = "README.md"
+repository = "https://github.com/cloudiful/scheduler"
+homepage = "https://github.com/cloudiful/scheduler"
+documentation = "https://docs.rs/cloudiful-scheduler"
+keywords = ["scheduler", "cron", "tokio", "valkey"]
+categories = ["asynchronous", "date-and-time"]
+publish = ["crates-io", "kellnr"]
+
+[lib]
+name = "scheduler"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+valkey-store = ["dep:redis", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+chrono = {version = "0.4.44", features = ["serde"]}
+chrono-tz = "0.10.4"
+cron = "0.16.0"
+log = "0.4.29"
+tokio = { version = "1.51.1", features = [ "macros", "rt", "rt-multi-thread", "sync", "time" ] }
+redis = { version = "1.2.0", optional = true, features = [ "tokio-comp", "connection-manager" ] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }

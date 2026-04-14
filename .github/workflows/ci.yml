@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run default tests
+        run: cargo test
+
+      - name: Run feature-gated tests
+        run: cargo test --features valkey-store
+
+      - name: Run Valkey integration tests
+        env:
+          SCHEDULER_VALKEY_URL: ${{ secrets.SCHEDULER_VALKEY_URL }}
+        run: |
+          if [ -z "$SCHEDULER_VALKEY_URL" ]; then
+            echo "Skipping Valkey integration tests: missing secret SCHEDULER_VALKEY_URL"
+            exit 0
+          fi
+
+          cargo test --features valkey-store --test valkey_store -- --ignored
