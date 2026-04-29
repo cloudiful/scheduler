@@ -41,6 +41,13 @@ pub enum StoreErrorKind {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionGuardErrorKind {
+    Connection,
+    Data,
+    Unknown,
+}
+
 #[derive(Debug)]
 pub struct StoreError {
     kind: StoreErrorKind,
@@ -70,6 +77,40 @@ impl Display for StoreError {
 }
 
 impl Error for StoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecutionGuardError {
+    kind: ExecutionGuardErrorKind,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl ExecutionGuardError {
+    pub fn new<E>(source: E, kind: ExecutionGuardErrorKind) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            kind,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn kind(&self) -> ExecutionGuardErrorKind {
+        self.kind
+    }
+}
+
+impl Display for ExecutionGuardError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl Error for ExecutionGuardError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(self.source.as_ref())
     }
@@ -110,6 +151,7 @@ impl Error for TaskJoinError {}
 pub enum SchedulerError {
     InvalidJob(InvalidJobError),
     Store(StoreError),
+    ExecutionGuard(ExecutionGuardError),
     TaskJoin(TaskJoinError),
 }
 
@@ -118,6 +160,9 @@ impl Display for SchedulerError {
         match self {
             SchedulerError::InvalidJob(message) => write!(f, "invalid job: {message}"),
             SchedulerError::Store(error) => write!(f, "state store error: {error}"),
+            SchedulerError::ExecutionGuard(error) => {
+                write!(f, "execution guard error: {error}")
+            }
             SchedulerError::TaskJoin(message) => write!(f, "task join error: {message}"),
         }
     }
@@ -171,5 +216,12 @@ impl SchedulerError {
             kind,
             message: error.to_string(),
         })
+    }
+
+    pub(crate) fn execution_guard<E>(error: E, kind: ExecutionGuardErrorKind) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::ExecutionGuard(ExecutionGuardError::new(error, kind))
     }
 }

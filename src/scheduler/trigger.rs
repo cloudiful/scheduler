@@ -10,6 +10,7 @@ use chrono_tz::Tz;
 pub(crate) struct PendingTrigger {
     pub(crate) scheduled_at: DateTime<Utc>,
     pub(crate) catch_up: bool,
+    pub(crate) trigger_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,7 @@ where
                 return Ok(TriggerDecision::Trigger(PendingTrigger {
                     scheduled_at: summary.first_due,
                     catch_up: false,
+                    trigger_count: state.trigger_count,
                 }));
             }
 
@@ -65,6 +67,7 @@ where
             Ok(TriggerDecision::Trigger(PendingTrigger {
                 scheduled_at,
                 catch_up: summary.count > 1 || is_missed(scheduled_at, now),
+                trigger_count: state.trigger_count,
             }))
         }
         crate::MissedRunPolicy::ReplayAll => {
@@ -77,6 +80,7 @@ where
             Ok(TriggerDecision::Trigger(PendingTrigger {
                 scheduled_at: first_due,
                 catch_up: window.has_multiple || is_missed(first_due, now),
+                trigger_count: state.trigger_count,
             }))
         }
     }
@@ -171,6 +175,7 @@ mod tests {
             TriggerDecision::Trigger(PendingTrigger {
                 scheduled_at: first.with_timezone(&Utc),
                 catch_up: true,
+                trigger_count: 1,
             })
         );
         assert_eq!(state.trigger_count, 1);

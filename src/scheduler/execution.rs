@@ -1,16 +1,22 @@
 use crate::model::{
     JobState, RunContext, RunRecord, RunStatus, TaskContext, TaskHandler, push_history,
 };
+use crate::observer::{SchedulerEvent, SchedulerObserver};
+use crate::{ExecutionGuard, ExecutionGuardRenewal, ExecutionLease};
+use crate::scheduler::control::ControlSignal;
 use crate::scheduler::trigger::PendingTrigger;
 use chrono::Utc;
 use chrono_tz::Tz;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant, interval_at};
 
 #[derive(Debug)]
 pub(crate) struct CompletedRun {
     pub(crate) record: RunRecord,
+    pub(crate) trigger_count: u32,
 }
 
 impl CompletedRun {
@@ -36,34 +42,90 @@ impl CompletedRun {
     }
 }
 
-pub(crate) fn spawn_trigger<D>(
+pub(crate) fn spawn_trigger<D, G>(
     active: &mut JoinSet<CompletedRun>,
     task: TaskHandler<D>,
     deps: Arc<D>,
     job_id: String,
     timezone: Tz,
     trigger: PendingTrigger,
+    guard: Arc<G>,
+    observer: Arc<dyn SchedulerObserver>,
+    control: watch::Sender<ControlSignal>,
+    lease: ExecutionLease,
 ) where
+    G: ExecutionGuard + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     active.spawn(async move {
         let started_at = Utc::now();
-        let result = task(TaskContext {
+        let task_future = task(TaskContext {
             run: RunContext {
-                job_id,
+                job_id: job_id.clone(),
                 scheduled_at: trigger.scheduled_at,
                 catch_up: trigger.catch_up,
                 timezone,
             },
             deps,
-        })
-        .await;
+        });
+        tokio::pin!(task_future);
+        let renew_every = guard.renew_interval(&lease);
+        let mut renewal = renewal_schedule(renew_every);
+        let mut lost_reported = false;
+
+        let result = loop {
+            if let Some(ticker) = renewal.as_mut() {
+                let mut stop_renewal = false;
+                let outcome = tokio::select! {
+                    result = &mut task_future => Some(result),
+                    _ = ticker.tick() => {
+                        match guard.renew(&lease).await {
+                            Ok(ExecutionGuardRenewal::Renewed) => {}
+                            Ok(ExecutionGuardRenewal::Lost) | Err(_) => {
+                                if !lost_reported {
+                                    observer.on_event(&SchedulerEvent::ExecutionGuardLost {
+                                        job_id: job_id.clone(),
+                                        scheduled_at: trigger.scheduled_at,
+                                        catch_up: trigger.catch_up,
+                                        trigger_count: trigger.trigger_count,
+                                    });
+                                    let _ = control.send(ControlSignal::Shutdown);
+                                    lost_reported = true;
+                                }
+                                stop_renewal = true;
+                            }
+                        }
+                        None
+                    }
+                };
+
+                if stop_renewal {
+                    renewal = None;
+                }
+
+                if let Some(result) = outcome {
+                    break result;
+                }
+            } else {
+                break task_future.await;
+            }
+        };
         let finished_at = Utc::now();
 
         let (status, error) = match result {
             Ok(()) => (RunStatus::Success, None),
             Err(message) => (RunStatus::Failed, Some(message)),
         };
+
+        if let Err(error) = guard.release(&lease).await {
+            observer.on_event(&SchedulerEvent::ExecutionGuardReleaseFailed {
+                job_id: job_id.clone(),
+                scheduled_at: trigger.scheduled_at,
+                catch_up: trigger.catch_up,
+                trigger_count: trigger.trigger_count,
+                error: error.to_string(),
+            });
+        }
 
         CompletedRun {
             record: RunRecord {
@@ -74,6 +136,11 @@ pub(crate) fn spawn_trigger<D>(
                 status,
                 error,
             },
+            trigger_count: trigger.trigger_count,
         }
     });
+}
+
+fn renewal_schedule(renew_interval: Option<Duration>) -> Option<tokio::time::Interval> {
+    renew_interval.map(|duration| interval_at(Instant::now() + duration, duration))
 }

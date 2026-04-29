@@ -41,16 +41,23 @@
 //! ```
 
 mod error;
+mod execution_guard;
 mod model;
 mod observer;
 mod scheduler;
 mod store;
+#[cfg(feature = "valkey-guard")]
+mod valkey_guard;
 #[cfg(feature = "valkey-store")]
 mod valkey_store;
 
 pub use error::{
-    InvalidJobError, InvalidJobKind, SchedulerError, StoreError, StoreErrorKind, TaskJoinError,
-    TaskJoinErrorKind,
+    ExecutionGuardError, ExecutionGuardErrorKind, InvalidJobError, InvalidJobKind,
+    SchedulerError, StoreError, StoreErrorKind, TaskJoinError, TaskJoinErrorKind,
+};
+pub use execution_guard::{
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionLease, ExecutionSlot,
+    NoopExecutionGuard,
 };
 pub use model::{
     CronSchedule, Job, JobFuture, JobResult, JobState, MissedRunPolicy, OverlapPolicy, RunContext,
@@ -66,5 +73,7 @@ pub use store::{
     InMemoryStateStore, ResilientStateStore, ResilientStoreError, StateStore, StoreEvent,
     StoreOperation,
 };
+#[cfg(feature = "valkey-guard")]
+pub use valkey_guard::{ValkeyExecutionGuard, ValkeyLeaseConfig};
 #[cfg(feature = "valkey-store")]
 pub use valkey_store::ValkeyStateStore;

@@ -46,6 +46,25 @@ pub enum SchedulerEvent {
         status: RunStatus,
         error: Option<String>,
     },
+    ExecutionGuardContended {
+        job_id: String,
+        scheduled_at: DateTime<Utc>,
+        catch_up: bool,
+        trigger_count: u32,
+    },
+    ExecutionGuardLost {
+        job_id: String,
+        scheduled_at: DateTime<Utc>,
+        catch_up: bool,
+        trigger_count: u32,
+    },
+    ExecutionGuardReleaseFailed {
+        job_id: String,
+        scheduled_at: DateTime<Utc>,
+        catch_up: bool,
+        trigger_count: u32,
+        error: String,
+    },
     StoreDegraded {
         job_id: String,
         operation: StoreOperation,
@@ -116,6 +135,34 @@ impl SchedulerObserver for LogObserver {
             } => debug!(
                 "scheduler run completed job_id={} scheduled_at={} catch_up={} trigger_count={} status={:?} error={:?}",
                 job_id, scheduled_at, catch_up, trigger_count, status, error
+            ),
+            SchedulerEvent::ExecutionGuardContended {
+                job_id,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+            } => debug!(
+                "scheduler execution guard contended job_id={} scheduled_at={} catch_up={} trigger_count={}",
+                job_id, scheduled_at, catch_up, trigger_count
+            ),
+            SchedulerEvent::ExecutionGuardLost {
+                job_id,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+            } => warn!(
+                "scheduler execution guard lost job_id={} scheduled_at={} catch_up={} trigger_count={}",
+                job_id, scheduled_at, catch_up, trigger_count
+            ),
+            SchedulerEvent::ExecutionGuardReleaseFailed {
+                job_id,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                error,
+            } => warn!(
+                "scheduler execution guard release failed job_id={} scheduled_at={} catch_up={} trigger_count={} error={}",
+                job_id, scheduled_at, catch_up, trigger_count, error
             ),
             SchedulerEvent::StoreDegraded {
                 job_id,

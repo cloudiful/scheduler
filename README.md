@@ -15,17 +15,19 @@ Version `0.3.3` exposes:
 - missed-run handling via `MissedRunPolicy`
 - overlap control via `OverlapPolicy`
 - persistent job state via `StateStore`
+- optional distributed per-occurrence execution leases via `ExecutionGuard`
 - optional terminal-state cleanup via `TerminalStatePolicy`
 - optional runtime observation via `SchedulerObserver`
 - bounded execution history via `SchedulerReport`
 
 Optional features:
 
+- `valkey-guard` adds `ValkeyExecutionGuard` for Valkey-backed execution leases keyed by `job_id + scheduled_at`.
 - `valkey-store` adds `ValkeyStateStore` for Valkey-backed state persistence.
   - `ValkeyStateStore::resilient(...)` permanently downgrades to an in-process mirror after connection-class failures.
 
 The scheduler is responsible only for deciding when to trigger work. Domain-specific recovery, cursor logic, and idempotent refresh commands stay in the caller.
-State recovery is keyed only by `job_id`; this crate does not provide distributed locking or leader election.
+State recovery is keyed only by `job_id`. `StateStore` does not provide distributed locking or leader election by itself; use `ExecutionGuard` when multiple scheduler instances may see the same trigger.
 
 ## Add the crate
 
@@ -45,6 +47,14 @@ scheduler = { package = "cloudiful-scheduler", version = "0.3.3", features = ["v
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
+Enable Valkey-backed execution leases:
+
+```toml
+[dependencies]
+scheduler = { package = "cloudiful-scheduler", version = "0.3.3", features = ["valkey-guard"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+```
+
 If you need to consume a tagged GitHub release directly:
 
 ```toml
@@ -57,6 +67,8 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Scheduler::new(config, store)` creates the runtime.
 - `Scheduler::with_observer(config, store, observer)` attaches structured runtime events.
 - `Scheduler::with_log_observer(config, store)` adapts runtime events to the `log` crate.
+- `Scheduler::with_execution_guard(config, store, guard)` adds distributed per-occurrence mutual exclusion.
+- `Scheduler::with_observer_and_execution_guard(config, store, observer, guard)` combines both.
 - `Task::from_async(task)` defines an async task from the full `TaskContext`.
 - `Task::from_sync(task)` defines a lightweight synchronous task from the full `TaskContext`.
 - `Task::from_blocking(task)` defines a blocking synchronous task via `tokio::task::spawn_blocking`.
@@ -277,8 +289,49 @@ async fn main() {
     )
     .with_max_runs(1);
 
-    let report = scheduler.run(job).await.unwrap();
+let report = scheduler.run(job).await.unwrap();
 println!("next run: {:?}", report.state.next_run_at);
+}
+```
+
+## Example: Valkey-backed execution guard
+
+This keeps `StateStore` and distributed mutual exclusion separate. The guard lease key is based on `job_id + scheduled_at`, so `OverlapPolicy::AllowParallel` can still run different occurrences concurrently.
+
+```rust
+use std::time::Duration;
+
+use scheduler::{
+    InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task, ValkeyExecutionGuard,
+    ValkeyLeaseConfig,
+};
+
+#[tokio::main]
+async fn main() {
+    let guard = ValkeyExecutionGuard::new(
+        "redis://127.0.0.1/",
+        ValkeyLeaseConfig {
+            ttl: Duration::from_secs(30),
+            renew_interval: Duration::from_secs(10),
+        },
+    )
+    .await
+    .unwrap();
+    let scheduler = Scheduler::with_execution_guard(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+        guard,
+    );
+
+    let job = Job::without_deps(
+        "refresh-cache",
+        Schedule::Interval(Duration::from_secs(5)),
+        Task::from_async(|_| async move { Ok(()) }),
+    )
+    .with_max_runs(1);
+
+    let report = scheduler.run(job).await.unwrap();
+    println!("history length: {}", report.history.len());
 }
 ```
 
@@ -288,6 +341,12 @@ The Valkey integration tests are marked `ignored` so normal CI stays hermetic. R
 
 ```bash
 SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-store --test valkey_store -- --ignored
+```
+
+For the execution guard integration tests:
+
+```bash
+SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-guard --test execution_guard -- --ignored
 ```
 
 In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external Valkey integration test step in `.gitea/workflows/ci.yml`.
@@ -309,7 +368,8 @@ In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external V
 - `OverlapPolicy::AllowParallel` spawns overlapping runs.
 - `SchedulerConfig::timezone` is forwarded to `RunContext`, drives cron evaluation, and does not rewrite absolute `AtTimes` timestamps.
 - State recovery is keyed by `job_id`; restarting with the same `job_id` resumes from the stored `next_run_at`.
+- `ExecutionGuard` is keyed by trigger occurrence, not only by `job_id`, so different `scheduled_at` values can acquire separate leases.
 - Corrupted persisted interval state with `next_run_at = None` is repaired automatically if the job is not actually terminal.
 - `SchedulerConfig::terminal_state_policy = Delete` removes persisted terminal state once the job finishes.
 - `ResilientStateStore` masks connection-class failures by switching permanently to its in-process mirror; degradation can be observed via `SchedulerObserver`.
-- The crate does not provide distributed mutual exclusion across scheduler instances.
+- `StateStore` and `ExecutionGuard` are intentionally separate: state persistence does not imply distributed mutual exclusion.

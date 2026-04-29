@@ -58,6 +58,7 @@ mod tests {
         PendingTrigger {
             scheduled_at: Utc::now(),
             catch_up: false,
+            trigger_count: 1,
         }
     }
 
