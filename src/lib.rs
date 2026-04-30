@@ -40,25 +40,36 @@
 //! });
 //! ```
 
+mod coordinated_store;
 mod error;
 mod execution_guard;
+mod guarded_runner;
 mod model;
 mod observer;
 mod scheduler;
 mod store;
+#[cfg(feature = "valkey-store")]
+mod valkey_coordinated_store;
+#[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
+mod valkey_execution_support;
 #[cfg(feature = "valkey-guard")]
 mod valkey_guard;
 #[cfg(feature = "valkey-store")]
 mod valkey_store;
 
+pub use coordinated_store::{
+    CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
+    CoordinatedStateStore, NoopCoordinatedStateStore,
+};
 pub use error::{
-    ExecutionGuardError, ExecutionGuardErrorKind, InvalidJobError, InvalidJobKind,
-    SchedulerError, StoreError, StoreErrorKind, TaskJoinError, TaskJoinErrorKind,
+    ExecutionGuardError, ExecutionGuardErrorKind, InvalidJobError, InvalidJobKind, SchedulerError,
+    StoreError, StoreErrorKind, TaskJoinError, TaskJoinErrorKind,
 };
 pub use execution_guard::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionLease, ExecutionSlot,
-    NoopExecutionGuard,
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionGuardScope,
+    ExecutionLease, ExecutionSlot, NoopExecutionGuard,
 };
+pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
     CronSchedule, Job, JobFuture, JobResult, JobState, MissedRunPolicy, OverlapPolicy, RunContext,
     RunRecord, RunStatus, Schedule, SchedulerConfig, SchedulerReport, Task, TaskContext,
@@ -73,6 +84,8 @@ pub use store::{
     InMemoryStateStore, ResilientStateStore, ResilientStoreError, StateStore, StoreEvent,
     StoreOperation,
 };
+#[cfg(feature = "valkey-store")]
+pub use valkey_coordinated_store::ValkeyCoordinatedStateStore;
 #[cfg(feature = "valkey-guard")]
 pub use valkey_guard::{ValkeyExecutionGuard, ValkeyLeaseConfig};
 #[cfg(feature = "valkey-store")]

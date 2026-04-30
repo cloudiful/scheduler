@@ -1,13 +1,16 @@
 use crate::error::{ExecutionGuardError, ExecutionGuardErrorKind};
-use crate::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionLease, ExecutionSlot,
+use crate::valkey_execution_support::{
+    lease_key, next_token, now_millis, occurrence_index_key, resource_lock_key,
 };
-use chrono::SecondsFormat;
-use redis::{Client, ErrorKind, Script, ServerErrorKind, aio::ConnectionManager, cmd};
+use crate::{
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionGuardScope,
+    ExecutionLease, ExecutionSlot,
+};
+use redis::{Client, ErrorKind, Script, ServerErrorKind, aio::ConnectionManager};
 use std::fmt::{self, Display, Formatter};
 use std::num::TryFromIntError;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 const DEFAULT_KEY_PREFIX: &str = "scheduler:valkey:execution-lease:";
 
@@ -60,6 +63,14 @@ impl ValkeyExecutionGuard {
         lease_key(&self.key_prefix, slot)
     }
 
+    fn resource_lock_key(&self, resource_id: &str) -> String {
+        resource_lock_key(&self.key_prefix, resource_id)
+    }
+
+    fn occurrence_index_key(&self, resource_id: &str) -> String {
+        occurrence_index_key(&self.key_prefix, resource_id)
+    }
+
     fn ttl_millis(&self) -> Result<u64, ValkeyExecutionGuardError> {
         u64::try_from(self.lease_config.ttl.as_millis())
             .map_err(ValkeyExecutionGuardError::DurationOutOfRange)
@@ -71,47 +82,125 @@ impl ExecutionGuard for ValkeyExecutionGuard {
 
     async fn acquire(&self, slot: ExecutionSlot) -> Result<ExecutionGuardAcquire, Self::Error> {
         let lease_key = self.lease_key(&slot);
-        let token = next_token();
+        let token = next_token(&TOKEN_COUNTER, "lease");
         let ttl_millis = self.ttl_millis()?;
+        let now_millis = now_millis();
+        let expires_at_millis = now_millis.saturating_add(ttl_millis);
         let mut connection = self.connection.clone();
-        let response: Option<String> = cmd("SET")
-            .arg(&lease_key)
-            .arg(&token)
-            .arg("NX")
-            .arg("PX")
-            .arg(ttl_millis)
-            .query_async(&mut connection)
-            .await
-            .map_err(ValkeyExecutionGuardError::Redis)?;
+        let acquired = match slot.scope {
+            ExecutionGuardScope::Occurrence => {
+                let resource_lock_key = self.resource_lock_key(&slot.resource_id);
+                let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
+                let acquired: i32 = Script::new(
+                    r"
+                    redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[1])
+                    if redis.call('EXISTS', KEYS[1]) == 1 then
+                        return 0
+                    end
+                    local ok = redis.call('SET', KEYS[2], ARGV[2], 'NX', 'PX', ARGV[3])
+                    if not ok then
+                        return 0
+                    end
+                    redis.call('ZADD', KEYS[3], ARGV[4], KEYS[2])
+                    return 1
+                    ",
+                )
+                .key(resource_lock_key)
+                .key(&lease_key)
+                .key(occurrence_index_key)
+                .arg(now_millis)
+                .arg(&token)
+                .arg(ttl_millis)
+                .arg(expires_at_millis)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?;
+                acquired == 1
+            }
+            ExecutionGuardScope::Resource => {
+                let resource_lock_key = self.resource_lock_key(&slot.resource_id);
+                let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
+                let acquired: i32 = Script::new(
+                    r"
+                    redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+                    if redis.call('EXISTS', KEYS[1]) == 1 then
+                        return 0
+                    end
+                    if redis.call('ZCARD', KEYS[2]) > 0 then
+                        return 0
+                    end
+                    local ok = redis.call('SET', KEYS[1], ARGV[2], 'NX', 'PX', ARGV[3])
+                    if not ok then
+                        return 0
+                    end
+                    return 1
+                    ",
+                )
+                .key(&resource_lock_key)
+                .key(occurrence_index_key)
+                .arg(now_millis)
+                .arg(&token)
+                .arg(ttl_millis)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?;
+                acquired == 1
+            }
+        };
 
-        Ok(match response {
-            Some(_) => ExecutionGuardAcquire::Acquired(ExecutionLease::new(
+        Ok(if acquired {
+            ExecutionGuardAcquire::Acquired(ExecutionLease::new(
                 slot.job_id,
+                slot.resource_id,
+                slot.scope,
                 slot.scheduled_at,
                 token,
                 lease_key,
-            )),
-            None => ExecutionGuardAcquire::Contended,
+            ))
+        } else {
+            ExecutionGuardAcquire::Contended
         })
     }
 
     async fn renew(&self, lease: &ExecutionLease) -> Result<ExecutionGuardRenewal, Self::Error> {
         let ttl_millis = self.ttl_millis()?;
+        let expires_at_millis = now_millis().saturating_add(ttl_millis);
         let mut connection = self.connection.clone();
-        let renewed: i32 = Script::new(
-            r"
-            if redis.call('GET', KEYS[1]) == ARGV[1] then
-                return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-            end
-            return 0
-            ",
-        )
-        .key(&lease.lease_key)
-        .arg(&lease.token)
-        .arg(ttl_millis)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyExecutionGuardError::Redis)?;
+        let renewed: i32 = match lease.scope {
+            ExecutionGuardScope::Occurrence => Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                    redis.call('ZADD', KEYS[2], ARGV[3], KEYS[1])
+                    return 1
+                end
+                redis.call('ZREM', KEYS[2], KEYS[1])
+                return 0
+                ",
+            )
+            .key(&lease.lease_key)
+            .key(self.occurrence_index_key(&lease.resource_id))
+            .arg(&lease.token)
+            .arg(ttl_millis)
+            .arg(expires_at_millis)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Resource => Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                end
+                return 0
+                ",
+            )
+            .key(&lease.lease_key)
+            .arg(&lease.token)
+            .arg(ttl_millis)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?,
+        };
 
         Ok(if renewed == 1 {
             ExecutionGuardRenewal::Renewed
@@ -122,19 +211,38 @@ impl ExecutionGuard for ValkeyExecutionGuard {
 
     async fn release(&self, lease: &ExecutionLease) -> Result<(), Self::Error> {
         let mut connection = self.connection.clone();
-        let _: i32 = Script::new(
-            r"
-            if redis.call('GET', KEYS[1]) == ARGV[1] then
-                return redis.call('DEL', KEYS[1])
-            end
-            return 0
-            ",
-        )
-        .key(&lease.lease_key)
-        .arg(&lease.token)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyExecutionGuardError::Redis)?;
+        let _: i32 = match lease.scope {
+            ExecutionGuardScope::Occurrence => Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    redis.call('DEL', KEYS[1])
+                    redis.call('ZREM', KEYS[2], KEYS[1])
+                    return 1
+                end
+                redis.call('ZREM', KEYS[2], KEYS[1])
+                return 0
+                ",
+            )
+            .key(&lease.lease_key)
+            .key(self.occurrence_index_key(&lease.resource_id))
+            .arg(&lease.token)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Resource => Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    return redis.call('DEL', KEYS[1])
+                end
+                return 0
+                ",
+            )
+            .key(&lease.lease_key)
+            .arg(&lease.token)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?,
+        };
 
         Ok(())
     }
@@ -144,9 +252,8 @@ impl ExecutionGuard for ValkeyExecutionGuard {
         Self: Sized,
     {
         match error {
-            ValkeyExecutionGuardError::Config(_) | ValkeyExecutionGuardError::DurationOutOfRange(_) => {
-                ExecutionGuardErrorKind::Data
-            }
+            ValkeyExecutionGuardError::Config(_)
+            | ValkeyExecutionGuardError::DurationOutOfRange(_) => ExecutionGuardErrorKind::Data,
             ValkeyExecutionGuardError::Redis(error) => classify_redis_error(error),
         }
     }
@@ -238,25 +345,6 @@ impl ValkeyLeaseConfig {
     }
 }
 
-fn lease_key(prefix: &str, slot: &ExecutionSlot) -> String {
-    format!(
-        "{}{}:{}",
-        prefix,
-        slot.job_id,
-        slot.scheduled_at
-            .to_rfc3339_opts(SecondsFormat::Nanos, true)
-    )
-}
-
-fn next_token() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let counter = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("lease-{now}-{counter}")
-}
-
 fn classify_redis_error(error: &redis::RedisError) -> ExecutionGuardErrorKind {
     if error.is_connection_dropped()
         || error.is_connection_refusal()
@@ -280,25 +368,37 @@ fn classify_redis_error(error: &redis::RedisError) -> ExecutionGuardErrorKind {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_KEY_PREFIX, lease_key, next_token};
-    use crate::ExecutionSlot;
+    use crate::{ExecutionGuardScope, ExecutionSlot};
     use chrono::{TimeZone, Utc};
 
     #[test]
     fn generated_tokens_are_not_empty() {
-        assert_ne!(next_token(), "");
-        assert_ne!(next_token(), "");
+        assert_ne!(next_token(&super::TOKEN_COUNTER, "lease"), "");
+        assert_ne!(next_token(&super::TOKEN_COUNTER, "lease"), "");
     }
 
     #[test]
     fn lease_key_uses_default_prefix_and_occurrence_time() {
-        let slot = ExecutionSlot::new(
+        let slot = ExecutionSlot::for_occurrence(
             "job-1",
+            "resource-1",
             Utc.with_ymd_and_hms(2026, 4, 3, 1, 2, 3).unwrap(),
         );
 
         assert_eq!(
             lease_key(DEFAULT_KEY_PREFIX, &slot),
-            "scheduler:valkey:execution-lease:job-1:2026-04-03T01:02:03.000000000Z"
+            "scheduler:valkey:execution-lease:resource-1:occurrence:2026-04-03T01:02:03.000000000Z"
+        );
+    }
+
+    #[test]
+    fn resource_scope_lease_key_uses_resource_lock() {
+        let slot = ExecutionSlot::for_resource("job-1", "resource-1");
+
+        assert_eq!(slot.scope, ExecutionGuardScope::Resource);
+        assert_eq!(
+            lease_key(DEFAULT_KEY_PREFIX, &slot),
+            "scheduler:valkey:execution-lease:resource-1:resource"
         );
     }
 }

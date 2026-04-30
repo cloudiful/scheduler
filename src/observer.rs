@@ -1,3 +1,4 @@
+use crate::execution_guard::ExecutionGuardScope;
 use crate::model::RunStatus;
 use crate::store::StoreOperation;
 use chrono::{DateTime, Utc};
@@ -46,21 +47,71 @@ pub enum SchedulerEvent {
         status: RunStatus,
         error: Option<String>,
     },
-    ExecutionGuardContended {
+    ExecutionGuardAcquired {
         job_id: String,
-        scheduled_at: DateTime<Utc>,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
         catch_up: bool,
         trigger_count: u32,
     },
+    ExecutionGuardContended {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+    },
+    ExecutionGuardRenewed {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+        renewal_count: u32,
+    },
+    ExecutionGuardRenewFailed {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+        renewal_count: u32,
+        failed_renewal_count: u32,
+        error: String,
+    },
     ExecutionGuardLost {
         job_id: String,
-        scheduled_at: DateTime<Utc>,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+        renewal_count: u32,
+        failed_renewal_count: u32,
+    },
+    ExecutionGuardReleased {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
         catch_up: bool,
         trigger_count: u32,
     },
     ExecutionGuardReleaseFailed {
         job_id: String,
-        scheduled_at: DateTime<Utc>,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        lease_key: String,
+        scheduled_at: Option<DateTime<Utc>>,
         catch_up: bool,
         trigger_count: u32,
         error: String,
@@ -136,33 +187,119 @@ impl SchedulerObserver for LogObserver {
                 "scheduler run completed job_id={} scheduled_at={} catch_up={} trigger_count={} status={:?} error={:?}",
                 job_id, scheduled_at, catch_up, trigger_count, status, error
             ),
-            SchedulerEvent::ExecutionGuardContended {
+            SchedulerEvent::ExecutionGuardAcquired {
                 job_id,
+                resource_id,
+                scope,
+                lease_key,
                 scheduled_at,
                 catch_up,
                 trigger_count,
             } => debug!(
-                "scheduler execution guard contended job_id={} scheduled_at={} catch_up={} trigger_count={}",
-                job_id, scheduled_at, catch_up, trigger_count
+                "scheduler execution guard acquired job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={}",
+                job_id, resource_id, scope, lease_key, scheduled_at, catch_up, trigger_count
             ),
-            SchedulerEvent::ExecutionGuardLost {
+            SchedulerEvent::ExecutionGuardContended {
                 job_id,
+                resource_id,
+                scope,
                 scheduled_at,
                 catch_up,
                 trigger_count,
+            } => debug!(
+                "scheduler execution guard contended job_id={} resource_id={} scope={:?} scheduled_at={:?} catch_up={} trigger_count={}",
+                job_id, resource_id, scope, scheduled_at, catch_up, trigger_count
+            ),
+            SchedulerEvent::ExecutionGuardRenewed {
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count,
+            } => debug!(
+                "scheduler execution guard renewed job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={} renewal_count={}",
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count
+            ),
+            SchedulerEvent::ExecutionGuardRenewFailed {
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count,
+                failed_renewal_count,
+                error,
             } => warn!(
-                "scheduler execution guard lost job_id={} scheduled_at={} catch_up={} trigger_count={}",
-                job_id, scheduled_at, catch_up, trigger_count
+                "scheduler execution guard renew failed job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={} renewal_count={} failed_renewal_count={} error={}",
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count,
+                failed_renewal_count,
+                error
+            ),
+            SchedulerEvent::ExecutionGuardLost {
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count,
+                failed_renewal_count,
+            } => warn!(
+                "scheduler execution guard lost job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={} renewal_count={} failed_renewal_count={}",
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                renewal_count,
+                failed_renewal_count
+            ),
+            SchedulerEvent::ExecutionGuardReleased {
+                job_id,
+                resource_id,
+                scope,
+                lease_key,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+            } => debug!(
+                "scheduler execution guard released job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={}",
+                job_id, resource_id, scope, lease_key, scheduled_at, catch_up, trigger_count
             ),
             SchedulerEvent::ExecutionGuardReleaseFailed {
                 job_id,
+                resource_id,
+                scope,
+                lease_key,
                 scheduled_at,
                 catch_up,
                 trigger_count,
                 error,
             } => warn!(
-                "scheduler execution guard release failed job_id={} scheduled_at={} catch_up={} trigger_count={} error={}",
-                job_id, scheduled_at, catch_up, trigger_count, error
+                "scheduler execution guard release failed job_id={} resource_id={} scope={:?} lease_key={} scheduled_at={:?} catch_up={} trigger_count={} error={}",
+                job_id, resource_id, scope, lease_key, scheduled_at, catch_up, trigger_count, error
             ),
             SchedulerEvent::StoreDegraded {
                 job_id,

@@ -5,17 +5,46 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionGuardScope {
+    #[default]
+    Occurrence,
+    Resource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSlot {
     pub job_id: String,
-    pub scheduled_at: DateTime<Utc>,
+    pub resource_id: String,
+    pub scope: ExecutionGuardScope,
+    pub scheduled_at: Option<DateTime<Utc>>,
 }
 
 impl ExecutionSlot {
     pub fn new(job_id: impl Into<String>, scheduled_at: DateTime<Utc>) -> Self {
+        let job_id = job_id.into();
+        Self::for_occurrence(job_id.clone(), job_id, scheduled_at)
+    }
+
+    pub fn for_occurrence(
+        job_id: impl Into<String>,
+        resource_id: impl Into<String>,
+        scheduled_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             job_id: job_id.into(),
-            scheduled_at,
+            resource_id: resource_id.into(),
+            scope: ExecutionGuardScope::Occurrence,
+            scheduled_at: Some(scheduled_at),
+        }
+    }
+
+    pub fn for_resource(job_id: impl Into<String>, resource_id: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            resource_id: resource_id.into(),
+            scope: ExecutionGuardScope::Resource,
+            scheduled_at: None,
         }
     }
 }
@@ -23,7 +52,9 @@ impl ExecutionSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionLease {
     pub job_id: String,
-    pub scheduled_at: DateTime<Utc>,
+    pub resource_id: String,
+    pub scope: ExecutionGuardScope,
+    pub scheduled_at: Option<DateTime<Utc>>,
     pub token: String,
     pub lease_key: String,
 }
@@ -31,12 +62,16 @@ pub struct ExecutionLease {
 impl ExecutionLease {
     pub fn new(
         job_id: impl Into<String>,
-        scheduled_at: DateTime<Utc>,
+        resource_id: impl Into<String>,
+        scope: ExecutionGuardScope,
+        scheduled_at: Option<DateTime<Utc>>,
         token: impl Into<String>,
         lease_key: impl Into<String>,
     ) -> Self {
         Self {
             job_id: job_id.into(),
+            resource_id: resource_id.into(),
+            scope,
             scheduled_at,
             token: token.into(),
             lease_key: lease_key.into(),
@@ -95,6 +130,8 @@ impl ExecutionGuard for NoopExecutionGuard {
     async fn acquire(&self, slot: ExecutionSlot) -> Result<ExecutionGuardAcquire, Self::Error> {
         Ok(ExecutionGuardAcquire::Acquired(ExecutionLease::new(
             slot.job_id,
+            slot.resource_id,
+            slot.scope,
             slot.scheduled_at,
             "",
             "",

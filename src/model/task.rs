@@ -1,3 +1,4 @@
+use crate::execution_guard::ExecutionGuardScope;
 use crate::model::{MissedRunPolicy, OverlapPolicy, Schedule};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -55,6 +56,8 @@ where
 #[derive(Clone)]
 pub struct Job<D = ()> {
     pub job_id: String,
+    pub execution_resource_id: String,
+    pub guard_scope: ExecutionGuardScope,
     pub schedule: Schedule,
     pub max_runs: Option<u32>,
     pub missed_run_policy: MissedRunPolicy,
@@ -93,7 +96,9 @@ impl<D> Job<D> {
     fn from_parts(job_id: String, schedule: Schedule, deps: Arc<D>, task: Task<D>) -> Self {
         let (missed_run_policy, overlap_policy) = Self::default_policies();
         Self {
+            execution_resource_id: job_id.clone(),
             job_id,
+            guard_scope: ExecutionGuardScope::Occurrence,
             schedule,
             max_runs: None,
             missed_run_policy,
@@ -122,12 +127,24 @@ impl<D> Job<D> {
         self.overlap_policy = policy;
         self
     }
+
+    pub fn with_execution_resource_id(mut self, resource_id: impl Into<String>) -> Self {
+        self.execution_resource_id = resource_id.into();
+        self
+    }
+
+    pub fn with_guard_scope(mut self, scope: ExecutionGuardScope) -> Self {
+        self.guard_scope = scope;
+        self
+    }
 }
 
 impl<D> std::fmt::Debug for Job<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Job")
             .field("job_id", &self.job_id)
+            .field("execution_resource_id", &self.execution_resource_id)
+            .field("guard_scope", &self.guard_scope)
             .field("schedule", &self.schedule)
             .field("max_runs", &self.max_runs)
             .field("missed_run_policy", &self.missed_run_policy)

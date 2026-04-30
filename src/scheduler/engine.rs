@@ -1,39 +1,47 @@
+use super::control::{ControlSignal, SchedulerHandle};
+use super::coordinated::run_coordinated_scheduler;
+use super::legacy::run_legacy_scheduler;
+use crate::coordinated_store::{
+    CoordinatedLeaseConfig, CoordinatedStateStore, NoopCoordinatedStateStore,
+};
 use crate::error::SchedulerError;
-use crate::model::{
-    Job, JobState, RunRecord, SchedulerConfig, SchedulerReport, TerminalStatePolicy,
-};
-use crate::observer::{
-    LogObserver, NoopObserver, SchedulerEvent, SchedulerObserver, SchedulerStopReason,
-    StateLoadSource,
-};
-use crate::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionSlot, NoopExecutionGuard,
-};
-use crate::scheduler::control::{ControlSignal, SchedulerHandle};
-use crate::scheduler::execution::{CompletedRun, spawn_trigger};
-use crate::scheduler::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
-use crate::scheduler::trigger::{PendingTrigger, TriggerDecision, next_trigger};
-use crate::scheduler::trigger_math::{initial_next_run_at, next_run_is_in_future};
+use crate::model::{Job, JobState, SchedulerConfig};
+use crate::observer::{LogObserver, NoopObserver, SchedulerEvent, SchedulerObserver};
 use crate::store::{StateStore, StoreEvent};
+use crate::{ExecutionGuard, InMemoryStateStore, NoopExecutionGuard};
 use chrono::Utc;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 
-pub struct Scheduler<S, G = NoopExecutionGuard>
+pub(super) enum SchedulerBackend<S, G, C>
 where
     S: StateStore,
     G: ExecutionGuard,
+    C: CoordinatedStateStore,
 {
-    config: SchedulerConfig,
-    store: Arc<S>,
-    guard: Arc<G>,
-    observer: Arc<dyn SchedulerObserver>,
-    control: watch::Sender<ControlSignal>,
+    Legacy {
+        store: Arc<S>,
+        guard: Arc<G>,
+    },
+    Coordinated {
+        store: Arc<C>,
+        lease_config: CoordinatedLeaseConfig,
+    },
 }
 
-impl<S> Scheduler<S, NoopExecutionGuard>
+pub struct Scheduler<S, G = NoopExecutionGuard, C = NoopCoordinatedStateStore>
+where
+    S: StateStore,
+    G: ExecutionGuard,
+    C: CoordinatedStateStore,
+{
+    pub(super) config: SchedulerConfig,
+    pub(super) backend: SchedulerBackend<S, G, C>,
+    pub(super) observer: Arc<dyn SchedulerObserver>,
+    pub(super) control: watch::Sender<ControlSignal>,
+}
+
+impl<S> Scheduler<S, NoopExecutionGuard, NoopCoordinatedStateStore>
 where
     S: StateStore + Send + Sync + 'static,
 {
@@ -53,7 +61,7 @@ where
     }
 }
 
-impl<S, G> Scheduler<S, G>
+impl<S, G> Scheduler<S, G, NoopCoordinatedStateStore>
 where
     S: StateStore + Send + Sync + 'static,
     G: ExecutionGuard + Send + Sync + 'static,
@@ -74,120 +82,101 @@ where
         let (control, _) = watch::channel(ControlSignal::Running);
         Self {
             config,
-            store: Arc::new(store),
-            guard: Arc::new(guard),
+            backend: SchedulerBackend::Legacy {
+                store: Arc::new(store),
+                guard: Arc::new(guard),
+            },
             observer: Arc::new(observer),
             control,
         }
     }
+}
 
-    async fn load_or_initialize_state<D>(
-        &self,
-        job: &Job<D>,
-    ) -> Result<(JobState, bool), SchedulerError>
-    where
-        D: Send + Sync + 'static,
-    {
-        match self.load_state(&job.job_id).await? {
-            Some(state) => self.restore_persisted_state(job, state).await,
-            None => {
-                let state = JobState::new(
-                    job.job_id.clone(),
-                    initial_next_run_at(job, self.config.timezone)?,
-                );
-                self.emit(SchedulerEvent::StateLoaded {
-                    job_id: job.job_id.clone(),
-                    trigger_count: state.trigger_count,
-                    next_run_at: state.next_run_at,
-                    source: StateLoadSource::New,
-                });
-                Ok((state, true))
-            }
-        }
+impl<C> Scheduler<InMemoryStateStore, NoopExecutionGuard, C>
+where
+    C: CoordinatedStateStore + Send + Sync + 'static,
+{
+    pub fn with_coordinated_state_store(
+        config: SchedulerConfig,
+        store: C,
+        lease_config: CoordinatedLeaseConfig,
+    ) -> Self {
+        Self::with_observer_and_coordinated_state_store(config, store, NoopObserver, lease_config)
     }
 
-    async fn restore_persisted_state<D>(
-        &self,
-        job: &Job<D>,
-        mut state: JobState,
-    ) -> Result<(JobState, bool), SchedulerError>
+    pub fn with_observer_and_coordinated_state_store<O>(
+        config: SchedulerConfig,
+        store: C,
+        observer: O,
+        lease_config: CoordinatedLeaseConfig,
+    ) -> Self
     where
-        D: Send + Sync + 'static,
+        O: SchedulerObserver,
     {
-        if self.should_repair_interval_state(job, &state) {
-            let previous_next_run_at = state.next_run_at;
-            let repaired_next_run_at = initial_next_run_at(job, self.config.timezone)?;
-            state.next_run_at = repaired_next_run_at;
-            self.persist_state(&state).await?;
-            self.emit(SchedulerEvent::StateRepaired {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                previous_next_run_at,
-                repaired_next_run_at: state.next_run_at,
-            });
-            self.emit(SchedulerEvent::StateLoaded {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                next_run_at: state.next_run_at,
-                source: StateLoadSource::Repaired,
-            });
-        } else {
-            self.emit(SchedulerEvent::StateLoaded {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                next_run_at: state.next_run_at,
-                source: StateLoadSource::Restored,
-            });
+        let (control, _) = watch::channel(ControlSignal::Running);
+        Self {
+            config,
+            backend: SchedulerBackend::Coordinated {
+                store: Arc::new(store),
+                lease_config,
+            },
+            observer: Arc::new(observer),
+            control,
         }
+    }
+}
 
-        Ok((state, false))
+impl<S, G, C> Scheduler<S, G, C>
+where
+    S: StateStore + Send + Sync + 'static,
+    G: ExecutionGuard + Send + Sync + 'static,
+    C: CoordinatedStateStore + Send + Sync + 'static,
+{
+    pub(super) fn emit(&self, event: SchedulerEvent) {
+        self.observer.on_event(&event);
     }
 
-    fn should_repair_interval_state<D>(&self, job: &Job<D>, state: &JobState) -> bool
+    pub(super) fn should_repair_interval_state<D>(&self, job: &Job<D>, state: &JobState) -> bool
     where
         D: Send + Sync + 'static,
     {
         if state.next_run_at.is_some() {
             return false;
         }
-
         if !matches!(job.schedule, crate::Schedule::Interval(_)) {
             return false;
         }
-
         match job.max_runs {
             None => true,
             Some(max_runs) => state.trigger_count < max_runs,
         }
     }
 
-    async fn persist_state(&self, state: &JobState) -> Result<(), SchedulerError> {
-        self.store.save(state).await.map_err(|error| {
-            let kind = S::classify_error(&error);
-            SchedulerError::store(error, kind)
-        })?;
-        self.emit_store_events(&state.job_id).await
+    pub(super) fn should_wait_for_active_replay<D>(&self, job: &Job<D>, active_count: usize) -> bool
+    where
+        D: Send + Sync + 'static,
+    {
+        active_count > 0
+            && matches!(job.missed_run_policy, crate::MissedRunPolicy::ReplayAll)
+            && !matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
     }
 
-    async fn delete_state(&self, job_id: &str) -> Result<(), SchedulerError> {
-        self.store.delete(job_id).await.map_err(|error| {
-            let kind = S::classify_error(&error);
-            SchedulerError::store(error, kind)
-        })?;
-        self.emit_store_events(job_id).await
+    pub(super) async fn sleep_until_next(&self, next_run_at: Option<chrono::DateTime<Utc>>) {
+        let Some(next_run_at) = next_run_at else {
+            return;
+        };
+        let now = Utc::now();
+        if let Ok(duration) = (next_run_at - now).to_std() {
+            tokio::time::sleep(duration).await;
+        }
     }
 
-    async fn load_state(&self, job_id: &str) -> Result<Option<JobState>, SchedulerError> {
-        let state = self.store.load(job_id).await.map_err(|error| {
-            let kind = S::classify_error(&error);
-            SchedulerError::store(error, kind)
-        })?;
-        self.emit_store_events(job_id).await?;
-        Ok(state)
-    }
-
-    async fn emit_store_events(&self, job_id: &str) -> Result<(), SchedulerError> {
-        let events = self.store.drain_events().await.map_err(|error| {
+    pub(super) async fn emit_store_events_for(
+        &self,
+        store: &S,
+        job_id: &str,
+    ) -> Result<(), SchedulerError> {
+        let events = store.drain_events().await.map_err(|error| {
             let kind = S::classify_error(&error);
             SchedulerError::store(error, kind)
         })?;
@@ -203,249 +192,89 @@ where
                 }
             }
         }
-
         Ok(())
     }
 
-    fn emit(&self, event: SchedulerEvent) {
-        self.observer.on_event(&event);
-    }
-
-    async fn apply_completed_run(
+    pub(super) async fn load_state_from_legacy(
         &self,
-        state: &mut JobState,
-        history: &mut VecDeque<RunRecord>,
-        completed: CompletedRun,
+        store: &S,
+        job_id: &str,
+    ) -> Result<Option<JobState>, SchedulerError> {
+        let state = store.load(job_id).await.map_err(|error| {
+            let kind = S::classify_error(&error);
+            SchedulerError::store(error, kind)
+        })?;
+        self.emit_store_events_for(store, job_id).await?;
+        Ok(state)
+    }
+
+    pub(super) async fn persist_state_to_legacy(
+        &self,
+        store: &S,
+        state: &JobState,
     ) -> Result<(), SchedulerError> {
-        let trigger_count = completed.trigger_count;
-        let record = completed.apply_to(state, history, self.config.history_limit);
-        self.persist_state(state).await?;
-        self.emit(SchedulerEvent::RunCompleted {
-            job_id: state.job_id.clone(),
-            scheduled_at: record.scheduled_at,
-            catch_up: record.catch_up,
-            trigger_count,
-            status: record.status,
-            error: record.error,
-        });
-        Ok(())
+        store.save(state).await.map_err(|error| {
+            let kind = S::classify_error(&error);
+            SchedulerError::store(error, kind)
+        })?;
+        self.emit_store_events_for(store, &state.job_id).await
     }
 
-    fn should_wait_for_active_replay<D>(&self, job: &Job<D>, active_count: usize) -> bool {
-        active_count > 0
-            && matches!(job.missed_run_policy, crate::MissedRunPolicy::ReplayAll)
-            && !matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
+    pub(super) async fn delete_state_from_legacy(
+        &self,
+        store: &S,
+        job_id: &str,
+    ) -> Result<(), SchedulerError> {
+        store.delete(job_id).await.map_err(|error| {
+            let kind = S::classify_error(&error);
+            SchedulerError::store(error, kind)
+        })?;
+        self.emit_store_events_for(store, job_id).await
     }
 
-    fn normalize_job<D>(&self, mut job: Job<D>) -> Result<Job<D>, SchedulerError> {
+    fn normalize_job<D>(&self, mut job: Job<D>) -> Result<Job<D>, SchedulerError>
+    where
+        D: Send + Sync + 'static,
+    {
         match &mut job.schedule {
             crate::Schedule::Interval(every) => {
                 if every.is_zero() {
                     return Err(SchedulerError::invalid_zero_interval());
                 }
             }
-            crate::Schedule::AtTimes(times) => {
-                times.sort_unstable();
-            }
+            crate::Schedule::AtTimes(times) => times.sort_unstable(),
             crate::Schedule::Cron(_) => {}
+        }
+
+        if matches!(self.backend, SchedulerBackend::Coordinated { .. })
+            && matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
+        {
+            return Err(SchedulerError::invalid_job_with_kind(
+                crate::InvalidJobKind::Other,
+                "coordinated scheduler does not support OverlapPolicy::AllowParallel",
+            ));
         }
 
         Ok(job)
     }
 
-    async fn try_spawn_trigger<D>(
-        &self,
-        job: &Job<D>,
-        active: &mut JoinSet<CompletedRun>,
-        trigger: PendingTrigger,
-    ) -> Result<bool, SchedulerError>
-    where
-        D: Send + Sync + 'static,
-    {
-        let slot = ExecutionSlot::new(job.job_id.clone(), trigger.scheduled_at);
-        let acquired = self.guard.acquire(slot).await.map_err(|error| {
-            let kind = G::classify_error(&error);
-            SchedulerError::execution_guard(error, kind)
-        })?;
-
-        let ExecutionGuardAcquire::Acquired(lease) = acquired else {
-            self.emit(SchedulerEvent::ExecutionGuardContended {
-                job_id: job.job_id.clone(),
-                scheduled_at: trigger.scheduled_at,
-                catch_up: trigger.catch_up,
-                trigger_count: trigger.trigger_count,
-            });
-            return Ok(false);
-        };
-
-        spawn_trigger(
-            active,
-            job.task.clone(),
-            job.deps.clone(),
-            job.job_id.clone(),
-            self.config.timezone,
-            trigger,
-            self.guard.clone(),
-            self.observer.clone(),
-            self.control.clone(),
-            lease,
-        );
-        Ok(true)
-    }
-
-    async fn sleep_until_next(&self, next_run_at: Option<chrono::DateTime<Utc>>) {
-        let Some(next_run_at) = next_run_at else {
-            return;
-        };
-
-        let now = Utc::now();
-        if let Ok(duration) = (next_run_at - now).to_std() {
-            tokio::time::sleep(duration).await;
-        }
-    }
-}
-
-impl<S, G> Scheduler<S, G>
-where
-    S: StateStore + Send + Sync + 'static,
-    G: ExecutionGuard + Send + Sync + 'static,
-{
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle::new(self.control.clone())
     }
 
-    pub async fn run<D>(&self, job: Job<D>) -> Result<SchedulerReport, SchedulerError>
+    pub async fn run<D>(&self, job: Job<D>) -> Result<crate::SchedulerReport, SchedulerError>
     where
         D: Send + Sync + 'static,
     {
         let job = self.normalize_job(job)?;
-        let (mut state, state_is_new) = self.load_or_initialize_state(&job).await?;
-        let mut history = VecDeque::new();
-        let mut active = JoinSet::new();
-        let mut active_count = 0usize;
-        let mut queued_trigger = None;
-        let _ = self.control.send(ControlSignal::Running);
-        let mut control_rx = self.control.subscribe();
-        if state_is_new {
-            self.persist_state(&state).await?;
+        match &self.backend {
+            SchedulerBackend::Legacy { store, guard } => {
+                run_legacy_scheduler(self, job, store, guard).await
+            }
+            SchedulerBackend::Coordinated {
+                store,
+                lease_config,
+            } => run_coordinated_scheduler(self, job, store, *lease_config).await,
         }
-
-        loop {
-            if matches!(
-                *control_rx.borrow(),
-                ControlSignal::Cancel | ControlSignal::Shutdown
-            ) && active_count == 0
-            {
-                self.emit(SchedulerEvent::SchedulerStopped {
-                    job_id: job.job_id.clone(),
-                    trigger_count: state.trigger_count,
-                    reason: match *control_rx.borrow() {
-                        ControlSignal::Cancel => SchedulerStopReason::Cancelled,
-                        ControlSignal::Shutdown => SchedulerStopReason::Shutdown,
-                        ControlSignal::Running => SchedulerStopReason::ChannelClosed,
-                    },
-                });
-                break;
-            }
-
-            if matches!(*control_rx.borrow(), ControlSignal::Running) {
-                if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
-                    if self.try_spawn_trigger(&job, &mut active, trigger).await? {
-                        active_count += 1;
-                    }
-                    continue;
-                }
-
-                let now = Utc::now();
-                if self.should_wait_for_active_replay(&job, active_count) {
-                    // ReplayAll preserves every missed occurrence; serialize it instead of
-                    // letting overlap control drop overdue triggers while one run is active.
-                } else {
-                    match next_trigger(&job, &mut state, now, self.config.timezone)? {
-                        TriggerDecision::Idle => {}
-                        TriggerDecision::StateAdvanced => {
-                            self.persist_state(&state).await?;
-                        }
-                        TriggerDecision::Trigger(trigger) => {
-                            self.persist_state(&state).await?;
-                            self.emit(SchedulerEvent::TriggerEmitted {
-                                job_id: job.job_id.clone(),
-                                scheduled_at: trigger.scheduled_at,
-                                catch_up: trigger.catch_up,
-                                trigger_count: trigger.trigger_count,
-                            });
-                            match dispatch_trigger(
-                                job.overlap_policy,
-                                active_count,
-                                &mut queued_trigger,
-                                trigger,
-                            ) {
-                                OverlapAction::Spawn(trigger) => {
-                                    if self.try_spawn_trigger(&job, &mut active, trigger).await? {
-                                        active_count += 1;
-                                    }
-                                    continue;
-                                }
-                                OverlapAction::QueueUpdated | OverlapAction::Dropped => {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if state.next_run_at.is_none() && active_count == 0 && queued_trigger.is_none() {
-                if matches!(
-                    self.config.terminal_state_policy,
-                    TerminalStatePolicy::Delete
-                ) {
-                    self.delete_state(&job.job_id).await?;
-                    self.emit(SchedulerEvent::TerminalStateDeleted {
-                        job_id: job.job_id.clone(),
-                        trigger_count: state.trigger_count,
-                    });
-                }
-                self.emit(SchedulerEvent::SchedulerStopped {
-                    job_id: job.job_id.clone(),
-                    trigger_count: state.trigger_count,
-                    reason: SchedulerStopReason::Terminal,
-                });
-                break;
-            }
-
-            tokio::select! {
-                maybe_result = active.join_next(), if active_count > 0 => {
-                    if let Some(result) = maybe_result {
-                        active_count -= 1;
-                        let completed = result.map_err(SchedulerError::task_join)?;
-                        self.apply_completed_run(&mut state, &mut history, completed).await?;
-                    }
-                }
-                changed = control_rx.changed() => {
-                    if changed.is_err() {
-                        self.emit(SchedulerEvent::SchedulerStopped {
-                            job_id: job.job_id.clone(),
-                            trigger_count: state.trigger_count,
-                            reason: SchedulerStopReason::ChannelClosed,
-                        });
-                        break;
-                    }
-                }
-                _ = self.sleep_until_next(state.next_run_at), if matches!(*control_rx.borrow(), ControlSignal::Running) && queued_trigger.is_none() && next_run_is_in_future(state.next_run_at) => {}
-            }
-        }
-
-        while let Some(result) = active.join_next().await {
-            let completed = result.map_err(SchedulerError::task_join)?;
-            self.apply_completed_run(&mut state, &mut history, completed)
-                .await?;
-        }
-
-        Ok(SchedulerReport {
-            job_id: job.job_id.clone(),
-            state,
-            history: history.into_iter().collect(),
-        })
     }
 }

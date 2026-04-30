@@ -133,9 +133,16 @@ impl ExecutionGuard for FakeExecutionGuard {
         match plan {
             AcquirePlan::Acquired => Ok(ExecutionGuardAcquire::Acquired(ExecutionLease::new(
                 slot.job_id.clone(),
+                slot.resource_id.clone(),
+                slot.scope,
                 slot.scheduled_at,
                 format!("token-{}", state.acquire_count),
-                format!("lease:{}:{}", slot.job_id, slot.scheduled_at.to_rfc3339()),
+                match slot.scheduled_at {
+                    Some(scheduled_at) => {
+                        format!("lease:{}:{}", slot.resource_id, scheduled_at.to_rfc3339())
+                    }
+                    None => format!("lease:{}:resource", slot.resource_id),
+                },
             ))),
             AcquirePlan::Contended => Ok(ExecutionGuardAcquire::Contended),
             AcquirePlan::Error(kind, message) => Err(FakeGuardError { kind, message }),
@@ -597,12 +604,12 @@ async fn different_occurrences_for_same_job_can_both_acquire() {
     .await
     .expect("failed to create guard");
     let first_slot = ExecutionSlot::new("shared-job", Utc::now());
-    let second_slot = ExecutionSlot::new(
-        "shared-job",
-        Utc::now() + chrono::TimeDelta::seconds(1),
-    );
+    let second_slot = ExecutionSlot::new("shared-job", Utc::now() + chrono::TimeDelta::seconds(1));
 
-    let first = guard.acquire(first_slot.clone()).await.expect("first acquire failed");
+    let first = guard
+        .acquire(first_slot.clone())
+        .await
+        .expect("first acquire failed");
     let second = guard
         .acquire(second_slot.clone())
         .await
@@ -616,7 +623,10 @@ async fn different_occurrences_for_same_job_can_both_acquire() {
     };
 
     assert_ne!(first_lease.lease_key, second_lease.lease_key);
-    guard.release(&first_lease).await.expect("first release failed");
+    guard
+        .release(&first_lease)
+        .await
+        .expect("first release failed");
     guard
         .release(&second_lease)
         .await
@@ -695,7 +705,10 @@ async fn release_only_deletes_the_owner_token() {
         .set(&lease.lease_key, "foreign-token")
         .await
         .expect("failed to replace token");
-    guard.release(&lease).await.expect("release should not error");
+    guard
+        .release(&lease)
+        .await
+        .expect("release should not error");
 
     let remaining: Option<String> = connection
         .get(&lease.lease_key)
