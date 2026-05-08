@@ -1,3 +1,4 @@
+use crate::model::RunSkipReason;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "valkey-store")]
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ pub struct SchedulerReport {
     pub job_id: String,
     pub state: JobState,
     pub history: Vec<RunRecord>,
+    pub last_skip_reason: Option<RunSkipReason>,
 }
 
 pub(crate) fn push_history(

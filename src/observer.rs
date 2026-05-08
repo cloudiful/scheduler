@@ -1,5 +1,5 @@
 use crate::execution_guard::ExecutionGuardScope;
-use crate::model::RunStatus;
+use crate::model::{RunSkipReason, RunStatus};
 use crate::store::StoreOperation;
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
@@ -38,6 +38,13 @@ pub enum SchedulerEvent {
         scheduled_at: DateTime<Utc>,
         catch_up: bool,
         trigger_count: u32,
+    },
+    RunSkipped {
+        job_id: String,
+        scheduled_at: DateTime<Utc>,
+        catch_up: bool,
+        trigger_count: u32,
+        reason: RunSkipReason,
     },
     RunCompleted {
         job_id: String,
@@ -175,6 +182,16 @@ impl SchedulerObserver for LogObserver {
             } => debug!(
                 "scheduler trigger emitted job_id={} scheduled_at={} catch_up={} trigger_count={}",
                 job_id, scheduled_at, catch_up, trigger_count
+            ),
+            SchedulerEvent::RunSkipped {
+                job_id,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                reason,
+            } => debug!(
+                "scheduler run skipped job_id={} scheduled_at={} catch_up={} trigger_count={} reason={}",
+                job_id, scheduled_at, catch_up, trigger_count, reason
             ),
             SchedulerEvent::RunCompleted {
                 job_id,

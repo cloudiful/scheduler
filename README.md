@@ -9,9 +9,10 @@ Links:
 - docs.rs: <https://docs.rs/cloudiful-scheduler>
 - crates.io: <https://crates.io/crates/cloudiful-scheduler>
 
-Version `0.3.3` exposes:
+Version `0.3.5` exposes:
 
 - explicit schedules via `Schedule::Interval`, `Schedule::AtTimes`, or `Schedule::Cron`
+- job-level execution windows via `JobTimeWindow`
 - missed-run handling via `MissedRunPolicy`
 - overlap control via `OverlapPolicy`
 - persistent job state via `StateStore`
@@ -33,7 +34,7 @@ State recovery is keyed only by `job_id`. `StateStore` does not provide distribu
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.3" }
+scheduler = { package = "cloudiful-scheduler", version = "0.3.5" }
 chrono = "0.4"
 chrono-tz = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
@@ -43,7 +44,7 @@ Enable Valkey-backed state persistence:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.3", features = ["valkey-store"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.3.5", features = ["valkey-store"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -51,7 +52,7 @@ Enable Valkey-backed execution leases:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.3", features = ["valkey-guard"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.3.5", features = ["valkey-guard"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -59,7 +60,7 @@ If you need to consume a tagged GitHub release directly:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.3.3" }
+scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.3.5" }
 ```
 
 ## Core concepts
@@ -74,6 +75,7 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Task::from_blocking(task)` defines a blocking synchronous task via `tokio::task::spawn_blocking`.
 - `Job::without_deps(job_id, schedule, task)` defines a task with no injected dependencies.
 - `Job::new(job_id, schedule, deps, task)` defines a task with explicit injected `deps`.
+- `Job::with_time_window(window)` restricts execution to local weekdays and time segments.
 - `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
 - `SchedulerHandle::cancel()` stops while waiting.
 - `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
@@ -157,6 +159,40 @@ async fn main() {
     let report = scheduler.run(job).await.unwrap();
     println!("history length: {}", report.history.len());
 }
+```
+
+## Example: job execution window
+
+```rust
+use chrono::{NaiveTime, TimeDelta, Utc, Weekday};
+use chrono_tz::Asia::Shanghai;
+use scheduler::{InMemoryStateStore, Job, JobTimeWindow, Schedule, Scheduler, SchedulerConfig, Task, TimeWindowSegment};
+
+let window = JobTimeWindow {
+    timezone: Some(Shanghai),
+    weekdays: vec![Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri],
+    segments: vec![
+        TimeWindowSegment::new(
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        ),
+        TimeWindowSegment::new(
+            NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+        ),
+    ],
+};
+
+let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+let job = Job::without_deps(
+    "windowed-job",
+    Schedule::AtTimes(vec![Utc::now().with_timezone(&Shanghai) + TimeDelta::seconds(5)]),
+    Task::from_async(|_| async move { Ok(()) }),
+)
+    .with_time_window(window);
+
+let report = scheduler.run(job).await.unwrap();
+println!("skip reason: {:?}", report.last_skip_reason);
 ```
 
 ## Example: task with RunContext
@@ -289,8 +325,8 @@ async fn main() {
     )
     .with_max_runs(1);
 
-let report = scheduler.run(job).await.unwrap();
-println!("next run: {:?}", report.state.next_run_at);
+    let report = scheduler.run(job).await.unwrap();
+    println!("next run: {:?}", report.state.next_run_at);
 }
 ```
 
@@ -359,13 +395,14 @@ In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external V
 - `Schedule::Cron` evaluates a standard 5-field expression in `SchedulerConfig::timezone`.
 - `max_runs` applies to interval schedules, explicit `AtTimes` schedules, and cron schedules.
 - `with_max_runs(0)` exits immediately without running any task.
-- `Job::new_sync*` is for lightweight synchronous logic. Use `Job::new_blocking*` for blocking I/O or CPU-heavy synchronous work.
+- `Task::from_sync` is for lightweight synchronous logic. Use `Task::from_blocking` for blocking I/O or CPU-heavy synchronous work.
 - `MissedRunPolicy::Skip` drops missed occurrences and waits for the next future trigger.
 - `MissedRunPolicy::CatchUpOnce` runs one immediate compensating execution for missed occurrences.
 - `MissedRunPolicy::ReplayAll` replays each missed occurrence in schedule order.
 - `OverlapPolicy::Forbid` skips triggers while a run is active.
 - `OverlapPolicy::QueueOne` keeps at most one pending trigger while a run is active.
 - `OverlapPolicy::AllowParallel` spawns overlapping runs.
+- `JobTimeWindow` is checked at execution time; outside-window occurrences are consumed, skipped, and reported as `outside_time_window`.
 - `SchedulerConfig::timezone` is forwarded to `RunContext`, drives cron evaluation, and does not rewrite absolute `AtTimes` timestamps.
 - State recovery is keyed by `job_id`; restarting with the same `job_id` resumes from the stored `next_run_at`.
 - `ExecutionGuard` is keyed by trigger occurrence, not only by `job_id`, so different `scheduled_at` values can acquire separate leases.
@@ -373,3 +410,4 @@ In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external V
 - `SchedulerConfig::terminal_state_policy = Delete` removes persisted terminal state once the job finishes.
 - `ResilientStateStore` masks connection-class failures by switching permanently to its in-process mirror; degradation can be observed via `SchedulerObserver`.
 - `StateStore` and `ExecutionGuard` are intentionally separate: state persistence does not imply distributed mutual exclusion.
+- Jobs without `JobTimeWindow` keep the existing behavior.

@@ -32,6 +32,7 @@ where
         load_or_initialize_coordinated_state(scheduler, store.as_ref(), &job, true).await?;
     let mut state = runtime.state.clone();
     let mut history = VecDeque::new();
+    let mut last_skip_reason = None;
     let mut active = JoinSet::new();
     let mut active_count = 0usize;
     let mut queued_trigger: Option<PendingTrigger> = None;
@@ -62,6 +63,19 @@ where
             state = runtime.state.clone();
 
             if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
+                let now = Utc::now();
+                if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
+                    last_skip_reason = Some(reason);
+                    scheduler.emit(SchedulerEvent::RunSkipped {
+                        job_id: job.job_id.clone(),
+                        scheduled_at: trigger.scheduled_at,
+                        catch_up: trigger.catch_up,
+                        trigger_count: trigger.trigger_count,
+                        reason,
+                    });
+                    continue;
+                }
+
                 let claim = store
                     .claim_trigger(
                         &job.job_id,
@@ -155,6 +169,29 @@ where
                         }
                     }
                     TriggerDecision::Trigger(trigger) => {
+                        let now = Utc::now();
+                        if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
+                            let saved = store
+                                .save_state(&job.job_id, runtime.revision, &candidate_state)
+                                .await
+                                .map_err(|error| {
+                                    let kind = C::classify_store_error(&error);
+                                    SchedulerError::store(error, kind)
+                                })?;
+                            if saved {
+                                state = candidate_state;
+                                last_skip_reason = Some(reason);
+                                scheduler.emit(SchedulerEvent::RunSkipped {
+                                    job_id: job.job_id.clone(),
+                                    scheduled_at: trigger.scheduled_at,
+                                    catch_up: trigger.catch_up,
+                                    trigger_count: trigger.trigger_count,
+                                    reason,
+                                });
+                            }
+                            continue;
+                        }
+
                         match dispatch_trigger(
                             job.overlap_policy,
                             active_count,
@@ -289,6 +326,7 @@ where
         job_id: job.job_id.clone(),
         state,
         history: history.into_iter().collect(),
+        last_skip_reason,
     })
 }
 

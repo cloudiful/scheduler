@@ -1,9 +1,10 @@
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use scheduler::{
     CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
     CoordinatedStateStore, ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal,
     ExecutionGuardScope, ExecutionLease, ExecutionSlot, GuardedRunResult, GuardedRunner, Job,
-    OverlapPolicy, Schedule, Scheduler, SchedulerConfig, Task,
+    JobTimeWindow, OverlapPolicy, RunSkipReason, Schedule, Scheduler, SchedulerConfig,
+    SchedulerEvent, SchedulerObserver, Task,
 };
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -274,6 +275,23 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
 
 use scheduler::JobState;
 
+#[derive(Clone, Default)]
+struct RecordingObserver {
+    events: Arc<Mutex<Vec<SchedulerEvent>>>,
+}
+
+impl RecordingObserver {
+    fn snapshot(&self) -> Vec<SchedulerEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl SchedulerObserver for RecordingObserver {
+    fn on_event(&self, event: &SchedulerEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+}
+
 #[tokio::test]
 async fn guarded_runner_resource_scope_blocks_occurrence_scope_for_same_resource() {
     let guard = InMemoryScopeGuard::default();
@@ -369,4 +387,64 @@ async fn coordinated_scheduler_runs_basic_at_time_job() {
 
     assert_eq!(report.history.len(), 1);
     assert_eq!(report.state.trigger_count, 1);
+}
+
+#[tokio::test]
+async fn coordinated_scheduler_skips_outside_time_window() {
+    let when = Utc::now() + chrono::TimeDelta::milliseconds(20);
+    let state = JobState::new("coord-window-job", Some(when));
+    let store = FakeCoordinatedStore::new(state);
+    let observer = RecordingObserver::default();
+    let scheduler = Scheduler::with_observer_and_coordinated_state_store(
+        SchedulerConfig::default(),
+        store,
+        observer.clone(),
+        CoordinatedLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(50),
+        },
+    );
+
+    let report = scheduler
+        .run(
+            Job::without_deps(
+                "coord-window-job",
+                Schedule::AtTimes(vec![when.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                Task::from_async(|_| async { Ok(()) }),
+            )
+            .with_time_window(JobTimeWindow {
+                timezone: None,
+                weekdays: vec![match Utc::now()
+                    .with_timezone(&chrono_tz::Asia::Shanghai)
+                    .weekday()
+                {
+                    chrono::Weekday::Mon => chrono::Weekday::Tue,
+                    chrono::Weekday::Tue => chrono::Weekday::Wed,
+                    chrono::Weekday::Wed => chrono::Weekday::Thu,
+                    chrono::Weekday::Thu => chrono::Weekday::Fri,
+                    chrono::Weekday::Fri => chrono::Weekday::Sat,
+                    chrono::Weekday::Sat => chrono::Weekday::Sun,
+                    chrono::Weekday::Sun => chrono::Weekday::Mon,
+                }],
+                segments: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+
+    let events = observer.snapshot();
+
+    assert!(report.history.is_empty());
+    assert_eq!(
+        report.last_skip_reason,
+        Some(RunSkipReason::OutsideTimeWindow)
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SchedulerEvent::RunSkipped {
+            job_id,
+            reason,
+            ..
+        } if job_id == "coord-window-job" && *reason == RunSkipReason::OutsideTimeWindow
+    )));
 }

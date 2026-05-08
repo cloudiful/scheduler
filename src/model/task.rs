@@ -1,5 +1,5 @@
 use crate::execution_guard::ExecutionGuardScope;
-use crate::model::{MissedRunPolicy, OverlapPolicy, Schedule};
+use crate::model::{JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunSkipReason, Schedule};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use std::any::type_name;
@@ -59,6 +59,7 @@ pub struct Job<D = ()> {
     pub execution_resource_id: String,
     pub guard_scope: ExecutionGuardScope,
     pub schedule: Schedule,
+    pub time_window: Option<JobTimeWindow>,
     pub max_runs: Option<u32>,
     pub missed_run_policy: MissedRunPolicy,
     pub overlap_policy: OverlapPolicy,
@@ -100,6 +101,7 @@ impl<D> Job<D> {
             job_id,
             guard_scope: ExecutionGuardScope::Occurrence,
             schedule,
+            time_window: None,
             max_runs: None,
             missed_run_policy,
             overlap_policy,
@@ -128,6 +130,11 @@ impl<D> Job<D> {
         self
     }
 
+    pub fn with_time_window(mut self, time_window: JobTimeWindow) -> Self {
+        self.time_window = Some(time_window);
+        self
+    }
+
     pub fn with_execution_resource_id(mut self, resource_id: impl Into<String>) -> Self {
         self.execution_resource_id = resource_id.into();
         self
@@ -136,6 +143,19 @@ impl<D> Job<D> {
     pub fn with_guard_scope(mut self, scope: ExecutionGuardScope) -> Self {
         self.guard_scope = scope;
         self
+    }
+
+    pub(crate) fn skip_reason_at(
+        &self,
+        now: DateTime<Utc>,
+        fallback_timezone: Tz,
+    ) -> Option<RunSkipReason> {
+        let window = self.time_window.as_ref()?;
+        if window.matches(now, fallback_timezone) {
+            None
+        } else {
+            Some(RunSkipReason::OutsideTimeWindow)
+        }
     }
 }
 
@@ -146,6 +166,7 @@ impl<D> std::fmt::Debug for Job<D> {
             .field("execution_resource_id", &self.execution_resource_id)
             .field("guard_scope", &self.guard_scope)
             .field("schedule", &self.schedule)
+            .field("time_window", &self.time_window)
             .field("max_runs", &self.max_runs)
             .field("missed_run_policy", &self.missed_run_policy)
             .field("overlap_policy", &self.overlap_policy)

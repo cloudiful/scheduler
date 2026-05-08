@@ -27,6 +27,7 @@ where
 {
     let (mut state, state_is_new) = load_or_initialize_legacy_state(scheduler, store, &job).await?;
     let mut history = VecDeque::new();
+    let mut last_skip_reason = None;
     let mut active = JoinSet::new();
     let mut active_count = 0usize;
     let mut queued_trigger = None;
@@ -56,6 +57,19 @@ where
 
         if matches!(*control_rx.borrow(), ControlSignal::Running) {
             if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
+                let now = Utc::now();
+                if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
+                    last_skip_reason = Some(reason);
+                    scheduler.emit(SchedulerEvent::RunSkipped {
+                        job_id: job.job_id.clone(),
+                        scheduled_at: trigger.scheduled_at,
+                        catch_up: trigger.catch_up,
+                        trigger_count: trigger.trigger_count,
+                        reason,
+                    });
+                    continue;
+                }
+
                 if try_spawn_legacy_trigger(scheduler, guard, &job, &mut active, trigger).await? {
                     active_count += 1;
                 }
@@ -72,6 +86,19 @@ where
                     }
                     TriggerDecision::Trigger(trigger) => {
                         scheduler.persist_state_to_legacy(store, &state).await?;
+                        let now = Utc::now();
+                        if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
+                            last_skip_reason = Some(reason);
+                            scheduler.emit(SchedulerEvent::RunSkipped {
+                                job_id: job.job_id.clone(),
+                                scheduled_at: trigger.scheduled_at,
+                                catch_up: trigger.catch_up,
+                                trigger_count: trigger.trigger_count,
+                                reason,
+                            });
+                            continue;
+                        }
+
                         scheduler.emit(SchedulerEvent::TriggerEmitted {
                             job_id: job.job_id.clone(),
                             scheduled_at: trigger.scheduled_at,
@@ -159,6 +186,7 @@ where
         job_id: job.job_id.clone(),
         state,
         history: history.into_iter().collect(),
+        last_skip_reason,
     })
 }
 

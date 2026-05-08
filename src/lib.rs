@@ -11,6 +11,9 @@
 //! - [`Schedule::Interval`] schedules the first run at `now + interval`.
 //! - [`Schedule::Cron`] evaluates a standard 5-field cron expression in
 //!   [`SchedulerConfig::timezone`].
+//! - [`JobTimeWindow`] can restrict execution by local weekday and time
+//!   segments; outside-window occurrences are skipped with
+//!   [`RunSkipReason::OutsideTimeWindow`].
 //! - [`Job::with_max_runs`] applies to every schedule kind; `0` exits without
 //!   running.
 //! - [`SchedulerConfig::timezone`] is forwarded through [`RunContext`], drives
@@ -71,9 +74,9 @@ pub use execution_guard::{
 };
 pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
-    CronSchedule, Job, JobFuture, JobResult, JobState, MissedRunPolicy, OverlapPolicy, RunContext,
-    RunRecord, RunStatus, Schedule, SchedulerConfig, SchedulerReport, Task, TaskContext,
-    TerminalStatePolicy,
+    CronSchedule, Job, JobFuture, JobResult, JobState, JobTimeWindow, MissedRunPolicy,
+    OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus, Schedule, SchedulerConfig,
+    SchedulerReport, Task, TaskContext, TerminalStatePolicy, TimeWindowSegment,
 };
 pub use observer::{
     LogObserver, NoopObserver, SchedulerEvent, SchedulerObserver, SchedulerStopReason,
