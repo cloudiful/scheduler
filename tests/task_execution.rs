@@ -1,4 +1,7 @@
-mod support;
+#[path = "support/refresh.rs"]
+mod refresh_support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use chrono::Utc;
 use scheduler::{
@@ -9,7 +12,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use support::{RefreshDeps, shanghai_after};
+use refresh_support::RefreshDeps;
+use time_support::shanghai_after;
 
 #[tokio::test]
 async fn async_task_without_context_runs() {

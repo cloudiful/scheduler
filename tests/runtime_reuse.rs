@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use chrono::Utc;
 use scheduler::{
@@ -10,7 +11,7 @@ use scheduler::{
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use support::shanghai_after;
+use time_support::shanghai_after;
 
 #[derive(Clone, Default)]
 struct RecordingObserver {
@@ -263,13 +264,31 @@ async fn legacy_and_coordinated_share_core_event_sequence() {
     assert_eq!(coordinated_report.history.len(), 1);
     assert_eq!(
         core_event_kinds(&legacy_observer.snapshot()),
-        vec!["state_loaded", "trigger_emitted", "run_completed", "scheduler_stopped"]
+        vec![
+            "state_loaded",
+            "trigger_emitted",
+            "run_completed",
+            "scheduler_stopped"
+        ]
     );
     assert_eq!(
         core_event_kinds(&coordinated_observer.snapshot()),
-        vec!["state_loaded", "trigger_emitted", "run_completed", "scheduler_stopped"]
+        vec![
+            "state_loaded",
+            "trigger_emitted",
+            "run_completed",
+            "scheduler_stopped"
+        ]
     );
     let coordinated_events = coordinated_observer.snapshot();
-    assert!(coordinated_events.iter().any(|event| matches!(event, SchedulerEvent::ExecutionGuardAcquired { .. })));
-    assert!(coordinated_events.iter().any(|event| matches!(event, SchedulerEvent::ExecutionGuardReleased { .. })));
+    assert!(
+        coordinated_events
+            .iter()
+            .any(|event| matches!(event, SchedulerEvent::ExecutionGuardAcquired { .. }))
+    );
+    assert!(
+        coordinated_events
+            .iter()
+            .any(|event| matches!(event, SchedulerEvent::ExecutionGuardReleased { .. }))
+    );
 }

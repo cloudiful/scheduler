@@ -1,5 +1,6 @@
 use super::control::StopSignal;
 use super::engine::Scheduler;
+use super::execution::{CompletedRun, renewal_schedule};
 use crate::coordinated_store::{CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedStateStore};
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
@@ -9,7 +10,6 @@ use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use super::execution::{CompletedRun, renewal_schedule};
 
 #[derive(Debug)]
 pub(super) struct CoordinatedCompletedRun {

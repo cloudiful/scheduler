@@ -18,6 +18,14 @@ use std::sync::atomic::AtomicU64;
 const DEFAULT_STATE_KEY_PREFIX: &str = "scheduler:valkey:job-state:";
 const LEGACY_DEFAULT_STATE_KEY_PREFIX: &str = "scheduler:job-state:";
 const DEFAULT_EXECUTION_KEY_PREFIX: &str = "scheduler:valkey:execution-lease:";
+const SAVE_STATE_LUA: &str = include_str!("lua/valkey_coordinated_store/save_state.lua");
+const RECLAIM_INFLIGHT_LUA: &str =
+    include_str!("lua/valkey_coordinated_store/reclaim_inflight.lua");
+const CLAIM_TRIGGER_LUA: &str = include_str!("lua/valkey_coordinated_store/claim_trigger.lua");
+const RENEW_LEASE_LUA: &str = include_str!("lua/valkey_coordinated_store/renew_lease.lua");
+const COMPLETE_LUA: &str = include_str!("lua/valkey_coordinated_store/complete.lua");
+const PAUSE_LUA: &str = include_str!("lua/valkey_coordinated_store/pause.lua");
+const RESUME_LUA: &str = include_str!("lua/valkey_coordinated_store/resume.lua");
 
 const FIELD_VERSION: &str = "version";
 const FIELD_STATE: &str = "state";
@@ -212,29 +220,16 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let key = self.state_key(job_id);
         let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
         let mut connection = self.connection.clone();
-        let updated: i32 = Script::new(
-            r"
-            local version = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '-1')
-            local inflight = redis.call('HGET', KEYS[1], ARGV[3])
-            if inflight then
-                return 0
-            end
-            if version ~= tonumber(ARGV[2]) then
-                return 0
-            end
-            redis.call('HSET', KEYS[1], ARGV[1], version + 1, ARGV[4], ARGV[5])
-            return 1
-            ",
-        )
-        .key(key)
-        .arg(FIELD_VERSION)
-        .arg(revision)
-        .arg(FIELD_INFLIGHT_TOKEN)
-        .arg(FIELD_STATE)
-        .arg(payload)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let updated: i32 = Script::new(SAVE_STATE_LUA)
+            .key(key)
+            .arg(FIELD_VERSION)
+            .arg(revision)
+            .arg(FIELD_INFLIGHT_TOKEN)
+            .arg(FIELD_STATE)
+            .arg(payload)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
         Ok(updated == 1)
     }
 
@@ -251,69 +246,37 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let now_millis = now_millis();
         let expires_at_millis = now_millis.saturating_add(ttl_millis);
         let mut connection = self.connection.clone();
-        let result: Option<Vec<String>> = Script::new(
-            r"
-            local scheduled_at = redis.call('HGET', KEYS[1], ARGV[1])
-            local catch_up = redis.call('HGET', KEYS[1], ARGV[2])
-            local trigger_count = redis.call('HGET', KEYS[1], ARGV[3])
-            local inflight_resource_id = redis.call('HGET', KEYS[1], ARGV[4])
-            local inflight_scope = redis.call('HGET', KEYS[1], ARGV[5])
-            local inflight_expires_at = tonumber(redis.call('HGET', KEYS[1], ARGV[6]) or '0')
-            local state_payload = redis.call('HGET', KEYS[1], ARGV[7])
-            local version = tonumber(redis.call('HGET', KEYS[1], ARGV[8]) or '0')
-            local paused = redis.call('HGET', KEYS[1], ARGV[9])
-
-            if not scheduled_at or not inflight_resource_id or not inflight_scope then
-                return nil
-            end
-            if paused == '1' or paused == 'true' then
-                return nil
-            end
-            if inflight_expires_at > tonumber(ARGV[9]) then
-                return nil
-            end
-            redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[9])
-            if redis.call('EXISTS', KEYS[2]) == 1 then
-                return nil
-            end
-            local new_lease_key = ARGV[10] .. scheduled_at
-            local ok = redis.call('SET', new_lease_key, ARGV[11], 'NX', 'PX', ARGV[12])
-            if not ok then
-                return nil
-            end
-            redis.call('ZADD', KEYS[4], ARGV[13], new_lease_key)
-            redis.call('HSET', KEYS[1],
-                ARGV[6], ARGV[13],
-                ARGV[14], ARGV[11],
-                ARGV[15], new_lease_key,
-                ARGV[8], version + 1
-            )
-            return { tostring(version + 1), state_payload, scheduled_at, catch_up, trigger_count, inflight_scope, new_lease_key, ARGV[11] }
-            ",
-        )
-        .key(key)
-        .key(self.resource_lock_key(resource_id))
-        .key(lease_key.clone())
-        .key(self.occurrence_index_key(resource_id))
-        .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-        .arg(FIELD_INFLIGHT_CATCH_UP)
-        .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-        .arg(FIELD_INFLIGHT_RESOURCE_ID)
-        .arg(FIELD_INFLIGHT_SCOPE)
-        .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-        .arg(FIELD_STATE)
-        .arg(FIELD_VERSION)
-        .arg(FIELD_PAUSED)
-        .arg(now_millis)
-        .arg(format!("{}{}:occurrence:", self.execution_key_prefix, resource_id))
-        .arg(&token)
-        .arg(ttl_millis)
-        .arg(expires_at_millis)
-        .arg(FIELD_INFLIGHT_TOKEN)
-        .arg(FIELD_INFLIGHT_LEASE_KEY)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let result: Option<Vec<String>> = Script::new(RECLAIM_INFLIGHT_LUA)
+            .key(key)
+            .key(self.resource_lock_key(resource_id))
+            .key(lease_key.clone())
+            .key(self.occurrence_index_key(resource_id))
+            // ARGV layout:
+            //  1..9  = hash field names read from KEYS[1]
+            // 10..14 = reclaim timing + new lease payload
+            // 15..16 = hash field names updated on successful reclaim
+            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+            .arg(FIELD_INFLIGHT_CATCH_UP)
+            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+            .arg(FIELD_INFLIGHT_RESOURCE_ID)
+            .arg(FIELD_INFLIGHT_SCOPE)
+            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+            .arg(FIELD_STATE)
+            .arg(FIELD_VERSION)
+            .arg(FIELD_PAUSED)
+            .arg(now_millis)
+            .arg(format!(
+                "{}{}:occurrence:",
+                self.execution_key_prefix, resource_id
+            ))
+            .arg(&token)
+            .arg(ttl_millis)
+            .arg(expires_at_millis)
+            .arg(FIELD_INFLIGHT_TOKEN)
+            .arg(FIELD_INFLIGHT_LEASE_KEY)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
 
         let Some(values) = result else {
             return Ok(None);
@@ -374,82 +337,41 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let next_state_payload =
             serde_json::to_string(next_state).map_err(ValkeyStoreError::from)?;
         let mut connection = self.connection.clone();
-        let new_revision: i64 = Script::new(
-            r"
-            local version = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '-1')
-            local inflight = redis.call('HGET', KEYS[1], ARGV[2])
-            local paused = redis.call('HGET', KEYS[1], ARGV[4])
-            if paused == '1' or paused == 'true' then
-                return 0
-            end
-            if inflight then
-                local inflight_expires_at = tonumber(redis.call('HGET', KEYS[1], ARGV[3]) or '0')
-                if inflight_expires_at > tonumber(ARGV[5]) then
-                    return 0
-                end
-                return 0
-            end
-            if version ~= tonumber(ARGV[6]) then
-                return 0
-            end
-            redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[5])
-            if redis.call('EXISTS', KEYS[2]) == 1 then
-                return 0
-            end
-            local ok = redis.call('SET', KEYS[3], ARGV[7], 'NX', 'PX', ARGV[8])
-            if not ok then
-                return 0
-            end
-            redis.call('ZADD', KEYS[4], ARGV[9], KEYS[3])
-            redis.call('HSET', KEYS[1],
-                ARGV[1], version + 1,
-                ARGV[10], ARGV[11],
-                ARGV[12], ARGV[13],
-                ARGV[14], ARGV[15],
-                ARGV[16], ARGV[17],
-                ARGV[18], ARGV[19],
-                ARGV[20], ARGV[21],
-                ARGV[22], ARGV[7],
-                ARGV[23], KEYS[3],
-                ARGV[3], ARGV[9]
+        let new_revision: i64 = Script::new(CLAIM_TRIGGER_LUA)
+            .key(key)
+            .key(self.resource_lock_key(resource_id))
+            .key(&lease_key)
+            .key(self.occurrence_index_key(resource_id))
+            .arg(FIELD_VERSION)
+            .arg(FIELD_INFLIGHT_TOKEN)
+            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+            .arg(FIELD_PAUSED)
+            .arg(now_millis)
+            .arg(revision)
+            .arg(&token)
+            .arg(ttl_millis)
+            .arg(expires_at_millis)
+            .arg(FIELD_STATE)
+            .arg(next_state_payload)
+            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+            .arg(
+                trigger
+                    .scheduled_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
             )
-            return version + 1
-            ",
-        )
-        .key(key)
-        .key(self.resource_lock_key(resource_id))
-        .key(&lease_key)
-        .key(self.occurrence_index_key(resource_id))
-        .arg(FIELD_VERSION)
-        .arg(FIELD_INFLIGHT_TOKEN)
-        .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-        .arg(FIELD_PAUSED)
-        .arg(now_millis)
-        .arg(revision)
-        .arg(&token)
-        .arg(ttl_millis)
-        .arg(expires_at_millis)
-        .arg(FIELD_STATE)
-        .arg(next_state_payload)
-        .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-        .arg(
-            trigger
-                .scheduled_at
-                .to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )
-        .arg(FIELD_INFLIGHT_CATCH_UP)
-        .arg(trigger.catch_up)
-        .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-        .arg(trigger.trigger_count)
-        .arg(FIELD_INFLIGHT_RESOURCE_ID)
-        .arg(resource_id)
-        .arg(FIELD_INFLIGHT_SCOPE)
-        .arg("occurrence")
-        .arg(FIELD_INFLIGHT_TOKEN)
-        .arg(FIELD_INFLIGHT_LEASE_KEY)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+            .arg(FIELD_INFLIGHT_CATCH_UP)
+            .arg(trigger.catch_up)
+            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+            .arg(trigger.trigger_count)
+            .arg(FIELD_INFLIGHT_RESOURCE_ID)
+            .arg(resource_id)
+            .arg(FIELD_INFLIGHT_SCOPE)
+            .arg("occurrence")
+            .arg(FIELD_INFLIGHT_TOKEN)
+            .arg(FIELD_INFLIGHT_LEASE_KEY)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
 
         if new_revision <= 0 {
             return Ok(None);
@@ -482,28 +404,17 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let ttl_millis = u64::try_from(lease_config.ttl.as_millis()).unwrap_or(u64::MAX);
         let expires_at_millis = now_millis().saturating_add(ttl_millis);
         let mut connection = self.connection.clone();
-        let renewed: i32 = Script::new(
-            r"
-            if redis.call('GET', KEYS[1]) == ARGV[1] then
-                redis.call('PEXPIRE', KEYS[1], ARGV[2])
-                redis.call('ZADD', KEYS[2], ARGV[3], KEYS[1])
-                redis.call('HSET', KEYS[3], ARGV[4], ARGV[3])
-                return 1
-            end
-            redis.call('ZREM', KEYS[2], KEYS[1])
-            return 0
-            ",
-        )
-        .key(&lease.lease_key)
-        .key(self.occurrence_index_key(&lease.resource_id))
-        .key(self.state_key(&lease.job_id))
-        .arg(&lease.token)
-        .arg(ttl_millis)
-        .arg(expires_at_millis)
-        .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let renewed: i32 = Script::new(RENEW_LEASE_LUA)
+            .key(&lease.lease_key)
+            .key(self.occurrence_index_key(&lease.resource_id))
+            .key(self.state_key(&lease.job_id))
+            .arg(&lease.token)
+            .arg(ttl_millis)
+            .arg(expires_at_millis)
+            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
         Ok(if renewed == 1 {
             ExecutionGuardRenewal::Renewed
         } else {
@@ -521,41 +432,25 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let key = self.state_key(job_id);
         let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
         let mut connection = self.connection.clone();
-        let completed: i32 = Script::new(
-            r"
-            local version = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '-1')
-            local token = redis.call('HGET', KEYS[1], ARGV[2])
-            if version ~= tonumber(ARGV[3]) then
-                return 0
-            end
-            if token ~= ARGV[4] then
-                return 0
-            end
-            redis.call('DEL', KEYS[2])
-            redis.call('ZREM', KEYS[3], KEYS[2])
-            redis.call('HSET', KEYS[1], ARGV[1], version + 1, ARGV[5], ARGV[6])
-            redis.call('HDEL', KEYS[1], ARGV[2], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12])
-            return 1
-            ",
-        )
-        .key(key)
-        .key(&lease.lease_key)
-        .key(self.occurrence_index_key(&lease.resource_id))
-        .arg(FIELD_VERSION)
-        .arg(FIELD_INFLIGHT_TOKEN)
-        .arg(revision)
-        .arg(&lease.token)
-        .arg(FIELD_STATE)
-        .arg(payload)
-        .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-        .arg(FIELD_INFLIGHT_CATCH_UP)
-        .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-        .arg(FIELD_INFLIGHT_RESOURCE_ID)
-        .arg(FIELD_INFLIGHT_SCOPE)
-        .arg(FIELD_INFLIGHT_LEASE_KEY)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let completed: i32 = Script::new(COMPLETE_LUA)
+            .key(key)
+            .key(&lease.lease_key)
+            .key(self.occurrence_index_key(&lease.resource_id))
+            .arg(FIELD_VERSION)
+            .arg(FIELD_INFLIGHT_TOKEN)
+            .arg(revision)
+            .arg(&lease.token)
+            .arg(FIELD_STATE)
+            .arg(payload)
+            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+            .arg(FIELD_INFLIGHT_CATCH_UP)
+            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+            .arg(FIELD_INFLIGHT_RESOURCE_ID)
+            .arg(FIELD_INFLIGHT_SCOPE)
+            .arg(FIELD_INFLIGHT_LEASE_KEY)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
         Ok(completed == 1)
     }
 
@@ -573,48 +468,24 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
     async fn pause(&self, job_id: &str) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
         let mut connection = self.connection.clone();
-        let changed: i32 = Script::new(
-            r"
-            local paused = redis.call('HGET', KEYS[1], ARGV[1])
-            if not paused then
-                return 0
-            end
-            if paused == '1' or paused == 'true' then
-                return 0
-            end
-            redis.call('HSET', KEYS[1], ARGV[1], '1')
-            return 1
-            ",
-        )
-        .key(key)
-        .arg(FIELD_PAUSED)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let changed: i32 = Script::new(PAUSE_LUA)
+            .key(key)
+            .arg(FIELD_PAUSED)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
         Ok(changed == 1)
     }
 
     async fn resume(&self, job_id: &str) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
         let mut connection = self.connection.clone();
-        let changed: i32 = Script::new(
-            r"
-            local paused = redis.call('HGET', KEYS[1], ARGV[1])
-            if not paused then
-                return 0
-            end
-            if paused == '0' or paused == 'false' then
-                return 0
-            end
-            redis.call('HSET', KEYS[1], ARGV[1], '0')
-            return 1
-            ",
-        )
-        .key(key)
-        .arg(FIELD_PAUSED)
-        .invoke_async(&mut connection)
-        .await
-        .map_err(ValkeyStoreError::from)?;
+        let changed: i32 = Script::new(RESUME_LUA)
+            .key(key)
+            .arg(FIELD_PAUSED)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(ValkeyStoreError::from)?;
         Ok(changed == 1)
     }
 

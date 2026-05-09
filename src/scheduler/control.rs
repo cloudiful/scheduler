@@ -1,9 +1,9 @@
 use crate::error::SchedulerError;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

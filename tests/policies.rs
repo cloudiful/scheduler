@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use scheduler::{
     InMemoryStateStore, Job, MissedRunPolicy, OverlapPolicy, Schedule, Scheduler, SchedulerConfig,
@@ -9,7 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use support::shanghai_after;
+use time_support::shanghai_after;
 use tokio::sync::Mutex;
 
 #[tokio::test]

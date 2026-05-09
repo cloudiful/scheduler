@@ -1,4 +1,6 @@
-use super::coordinated_execution::{CoordinatedCompletedRun, apply_completed_coordinated_run, spawn_coordinated_trigger};
+use super::coordinated_execution::{
+    CoordinatedCompletedRun, apply_completed_coordinated_run, spawn_coordinated_trigger,
+};
 use super::engine::Scheduler;
 use super::overlap::OverlapAction;
 use super::runtime::{SchedulerRuntimeBackend, run_scheduler};

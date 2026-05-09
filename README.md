@@ -9,7 +9,7 @@ Links:
 - docs.rs: <https://docs.rs/cloudiful-scheduler>
 - crates.io: <https://crates.io/crates/cloudiful-scheduler>
 
-Version `0.3.5` exposes:
+Version `0.4.1` exposes:
 
 - explicit schedules via `Schedule::Interval`, `Schedule::AtTimes`, or `Schedule::Cron`
 - job-level execution windows via `JobTimeWindow`
@@ -20,6 +20,7 @@ Version `0.3.5` exposes:
 - optional terminal-state cleanup via `TerminalStatePolicy`
 - optional runtime observation via `SchedulerObserver`
 - bounded execution history via `SchedulerReport`
+- pause / resume control via `SchedulerHandle`
 
 Optional features:
 
@@ -34,7 +35,7 @@ State recovery is keyed only by `job_id`. `StateStore` does not provide distribu
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.5" }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.1" }
 chrono = "0.4"
 chrono-tz = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
@@ -44,7 +45,7 @@ Enable Valkey-backed state persistence:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.5", features = ["valkey-store"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.1", features = ["valkey-store"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -52,7 +53,7 @@ Enable Valkey-backed execution leases:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.3.5", features = ["valkey-guard"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.1", features = ["valkey-guard"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -60,7 +61,7 @@ If you need to consume a tagged GitHub release directly:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.3.5" }
+scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.4.1" }
 ```
 
 ## Core concepts

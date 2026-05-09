@@ -13,6 +13,12 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 const DEFAULT_KEY_PREFIX: &str = "scheduler:valkey:execution-lease:";
+const ACQUIRE_OCCURRENCE_LUA: &str = include_str!("lua/valkey_guard/acquire_occurrence.lua");
+const ACQUIRE_RESOURCE_LUA: &str = include_str!("lua/valkey_guard/acquire_resource.lua");
+const RENEW_OCCURRENCE_LUA: &str = include_str!("lua/valkey_guard/renew_occurrence.lua");
+const RENEW_RESOURCE_LUA: &str = include_str!("lua/valkey_guard/renew_resource.lua");
+const RELEASE_OCCURRENCE_LUA: &str = include_str!("lua/valkey_guard/release_occurrence.lua");
+const RELEASE_RESOURCE_LUA: &str = include_str!("lua/valkey_guard/release_resource.lua");
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -91,59 +97,31 @@ impl ExecutionGuard for ValkeyExecutionGuard {
             ExecutionGuardScope::Occurrence => {
                 let resource_lock_key = self.resource_lock_key(&slot.resource_id);
                 let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
-                let acquired: i32 = Script::new(
-                    r"
-                    redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[1])
-                    if redis.call('EXISTS', KEYS[1]) == 1 then
-                        return 0
-                    end
-                    local ok = redis.call('SET', KEYS[2], ARGV[2], 'NX', 'PX', ARGV[3])
-                    if not ok then
-                        return 0
-                    end
-                    redis.call('ZADD', KEYS[3], ARGV[4], KEYS[2])
-                    return 1
-                    ",
-                )
-                .key(resource_lock_key)
-                .key(&lease_key)
-                .key(occurrence_index_key)
-                .arg(now_millis)
-                .arg(&token)
-                .arg(ttl_millis)
-                .arg(expires_at_millis)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(ValkeyExecutionGuardError::Redis)?;
+                let acquired: i32 = Script::new(ACQUIRE_OCCURRENCE_LUA)
+                    .key(resource_lock_key)
+                    .key(&lease_key)
+                    .key(occurrence_index_key)
+                    .arg(now_millis)
+                    .arg(&token)
+                    .arg(ttl_millis)
+                    .arg(expires_at_millis)
+                    .invoke_async(&mut connection)
+                    .await
+                    .map_err(ValkeyExecutionGuardError::Redis)?;
                 acquired == 1
             }
             ExecutionGuardScope::Resource => {
                 let resource_lock_key = self.resource_lock_key(&slot.resource_id);
                 let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
-                let acquired: i32 = Script::new(
-                    r"
-                    redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
-                    if redis.call('EXISTS', KEYS[1]) == 1 then
-                        return 0
-                    end
-                    if redis.call('ZCARD', KEYS[2]) > 0 then
-                        return 0
-                    end
-                    local ok = redis.call('SET', KEYS[1], ARGV[2], 'NX', 'PX', ARGV[3])
-                    if not ok then
-                        return 0
-                    end
-                    return 1
-                    ",
-                )
-                .key(&resource_lock_key)
-                .key(occurrence_index_key)
-                .arg(now_millis)
-                .arg(&token)
-                .arg(ttl_millis)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(ValkeyExecutionGuardError::Redis)?;
+                let acquired: i32 = Script::new(ACQUIRE_RESOURCE_LUA)
+                    .key(&resource_lock_key)
+                    .key(occurrence_index_key)
+                    .arg(now_millis)
+                    .arg(&token)
+                    .arg(ttl_millis)
+                    .invoke_async(&mut connection)
+                    .await
+                    .map_err(ValkeyExecutionGuardError::Redis)?;
                 acquired == 1
             }
         };
@@ -167,39 +145,22 @@ impl ExecutionGuard for ValkeyExecutionGuard {
         let expires_at_millis = now_millis().saturating_add(ttl_millis);
         let mut connection = self.connection.clone();
         let renewed: i32 = match lease.scope {
-            ExecutionGuardScope::Occurrence => Script::new(
-                r"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    redis.call('PEXPIRE', KEYS[1], ARGV[2])
-                    redis.call('ZADD', KEYS[2], ARGV[3], KEYS[1])
-                    return 1
-                end
-                redis.call('ZREM', KEYS[2], KEYS[1])
-                return 0
-                ",
-            )
-            .key(&lease.lease_key)
-            .key(self.occurrence_index_key(&lease.resource_id))
-            .arg(&lease.token)
-            .arg(ttl_millis)
-            .arg(expires_at_millis)
-            .invoke_async(&mut connection)
-            .await
-            .map_err(ValkeyExecutionGuardError::Redis)?,
-            ExecutionGuardScope::Resource => Script::new(
-                r"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-                end
-                return 0
-                ",
-            )
-            .key(&lease.lease_key)
-            .arg(&lease.token)
-            .arg(ttl_millis)
-            .invoke_async(&mut connection)
-            .await
-            .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Occurrence => Script::new(RENEW_OCCURRENCE_LUA)
+                .key(&lease.lease_key)
+                .key(self.occurrence_index_key(&lease.resource_id))
+                .arg(&lease.token)
+                .arg(ttl_millis)
+                .arg(expires_at_millis)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Resource => Script::new(RENEW_RESOURCE_LUA)
+                .key(&lease.lease_key)
+                .arg(&lease.token)
+                .arg(ttl_millis)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?,
         };
 
         Ok(if renewed == 1 {
@@ -212,36 +173,19 @@ impl ExecutionGuard for ValkeyExecutionGuard {
     async fn release(&self, lease: &ExecutionLease) -> Result<(), Self::Error> {
         let mut connection = self.connection.clone();
         let _: i32 = match lease.scope {
-            ExecutionGuardScope::Occurrence => Script::new(
-                r"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    redis.call('DEL', KEYS[1])
-                    redis.call('ZREM', KEYS[2], KEYS[1])
-                    return 1
-                end
-                redis.call('ZREM', KEYS[2], KEYS[1])
-                return 0
-                ",
-            )
-            .key(&lease.lease_key)
-            .key(self.occurrence_index_key(&lease.resource_id))
-            .arg(&lease.token)
-            .invoke_async(&mut connection)
-            .await
-            .map_err(ValkeyExecutionGuardError::Redis)?,
-            ExecutionGuardScope::Resource => Script::new(
-                r"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    return redis.call('DEL', KEYS[1])
-                end
-                return 0
-                ",
-            )
-            .key(&lease.lease_key)
-            .arg(&lease.token)
-            .invoke_async(&mut connection)
-            .await
-            .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Occurrence => Script::new(RELEASE_OCCURRENCE_LUA)
+                .key(&lease.lease_key)
+                .key(self.occurrence_index_key(&lease.resource_id))
+                .arg(&lease.token)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?,
+            ExecutionGuardScope::Resource => Script::new(RELEASE_RESOURCE_LUA)
+                .key(&lease.lease_key)
+                .arg(&lease.token)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(ValkeyExecutionGuardError::Redis)?,
         };
 
         Ok(())

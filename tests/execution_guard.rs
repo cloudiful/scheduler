@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 #[cfg(feature = "valkey-guard")]
 use chrono::Utc;
@@ -16,7 +17,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use support::shanghai_after;
+use time_support::shanghai_after;
 
 #[cfg(feature = "valkey-guard")]
 use redis::{AsyncCommands, Client};

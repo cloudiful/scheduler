@@ -1,57 +1,35 @@
 #![cfg(feature = "valkey-store")]
 
+#[path = "support/valkey_runtime.rs"]
+mod valkey_runtime;
+#[path = "support/valkey_state_fixtures.rs"]
+mod valkey_state_fixtures;
+
 use chrono::{TimeDelta, Utc};
-use redis::{AsyncCommands, Client};
-use scheduler::{
-    Job, JobState, Schedule, Scheduler, SchedulerConfig, StateStore, Task, ValkeyStateStore,
-};
+use redis::AsyncCommands;
+use scheduler::{Job, Schedule, Scheduler, SchedulerConfig, StateStore, Task, ValkeyStateStore};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use valkey_runtime::{connection, unique_id, valkey_url};
+use valkey_state_fixtures::fixture_state;
 use tokio::sync::mpsc;
 
 const DEFAULT_KEY_PREFIX: &str = "scheduler:valkey:job-state:";
 const LEGACY_DEFAULT_KEY_PREFIX: &str = "scheduler:job-state:";
 
-fn valkey_url() -> Option<String> {
-    std::env::var("SCHEDULER_VALKEY_URL").ok()
-}
-
-fn unique_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    format!("scheduler-it-{}-{now}", std::process::id())
-}
-
-fn fixture_state(job_id: &str) -> JobState {
-    JobState {
-        job_id: job_id.to_string(),
-        trigger_count: 3,
-        last_run_at: Some(Utc::now()),
-        last_success_at: Some(Utc::now() + TimeDelta::seconds(1)),
-        next_run_at: Some(Utc::now() + TimeDelta::seconds(10)),
-        last_error: Some("integration".to_string()),
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
 async fn valkey_store_round_trips_state() {
     let url = valkey_url().expect("SCHEDULER_VALKEY_URL must be set");
-    let prefix = format!("scheduler:test:valkey-store:{}:", unique_id());
+    let prefix = format!("scheduler:test:valkey-store:{}:", unique_id("scheduler-it"));
     let store = ValkeyStateStore::with_prefix(&url, prefix.clone())
         .await
         .expect("failed to connect to valkey");
-    let client = Client::open(url).expect("invalid valkey url");
-    let mut connection = client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to get valkey connection");
-    let job_id = unique_id();
+    let mut connection = connection(&url).await;
+    let job_id = unique_id("scheduler-it");
     let key = format!("{prefix}{job_id}");
     let state = fixture_state(&job_id);
 
@@ -70,12 +48,8 @@ async fn valkey_store_reads_legacy_default_prefix() {
     let store = ValkeyStateStore::new(&url)
         .await
         .expect("failed to connect to valkey");
-    let client = Client::open(url).expect("invalid valkey url");
-    let mut connection = client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to get valkey connection");
-    let job_id = unique_id();
+    let mut connection = connection(&url).await;
+    let job_id = unique_id("scheduler-it");
     let legacy_key = format!("{LEGACY_DEFAULT_KEY_PREFIX}{job_id}");
     let default_key = format!("{DEFAULT_KEY_PREFIX}{job_id}");
     let state = fixture_state(&job_id);
@@ -104,13 +78,9 @@ async fn valkey_store_reads_legacy_default_prefix() {
 #[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
 async fn scheduler_restores_state_across_instances_using_valkey() {
     let url = valkey_url().expect("SCHEDULER_VALKEY_URL must be set");
-    let prefix = format!("scheduler:test:restore:{}:", unique_id());
-    let client = Client::open(url.clone()).expect("invalid valkey url");
-    let mut connection = client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to get valkey connection");
-    let job_id = unique_id();
+    let prefix = format!("scheduler:test:restore:{}:", unique_id("scheduler-it"));
+    let mut connection = connection(&url).await;
+    let job_id = unique_id("scheduler-it");
     let key = format!("{prefix}{job_id}");
     let scheduler_one = Scheduler::new(
         SchedulerConfig::default(),

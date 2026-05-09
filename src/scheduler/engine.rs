@@ -10,11 +10,11 @@ use crate::observer::{LogObserver, NoopObserver, SchedulerEvent, SchedulerObserv
 use crate::store::{StateStore, StoreEvent};
 use crate::{ExecutionGuard, InMemoryStateStore, NoopExecutionGuard};
 use chrono::Utc;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::watch;
 
 pub(super) enum SchedulerBackend<S, G, C>
@@ -142,9 +142,11 @@ where
     fn pause_controller(&self) -> Option<Arc<dyn PauseController>> {
         match &self.backend {
             SchedulerBackend::Legacy { .. } => None,
-            SchedulerBackend::Coordinated { store, .. } => Some(Arc::new(CoordinatedPauseController {
-                store: store.clone(),
-            })),
+            SchedulerBackend::Coordinated { store, .. } => {
+                Some(Arc::new(CoordinatedPauseController {
+                    store: store.clone(),
+                }))
+            }
         }
     }
 

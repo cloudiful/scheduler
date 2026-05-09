@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use chrono::{Datelike, NaiveTime, Timelike, Utc, Weekday};
 use chrono_tz::Asia::Shanghai;
@@ -11,7 +12,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use support::shanghai_after;
+use time_support::shanghai_after;
 
 #[derive(Clone, Default)]
 struct RecordingObserver {

@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use chrono::{TimeDelta, Utc};
 use chrono_tz::UTC;
@@ -7,12 +8,11 @@ use scheduler::{
     SchedulerEvent, SchedulerObserver, StateStore, Task,
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
-    Mutex,
 };
 use std::time::Duration;
-use support::shanghai_after;
+use time_support::shanghai_after;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Default)]

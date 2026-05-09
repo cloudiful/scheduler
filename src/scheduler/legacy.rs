@@ -57,9 +57,12 @@ where
         scheduler: &Scheduler<S, G, C>,
         job: &Job<D>,
     ) -> Result<LegacyRuntime, SchedulerError> {
-        let (state, state_is_new) = load_or_initialize_legacy_state(scheduler, self.store.as_ref(), job).await?;
+        let (state, state_is_new) =
+            load_or_initialize_legacy_state(scheduler, self.store.as_ref(), job).await?;
         if state_is_new {
-            scheduler.persist_state_to_legacy(self.store.as_ref(), &state).await?;
+            scheduler
+                .persist_state_to_legacy(self.store.as_ref(), &state)
+                .await?;
         }
         Ok(LegacyRuntime {
             state,
@@ -160,11 +163,8 @@ where
         completed: CompletedRun,
     ) -> Result<(), SchedulerError> {
         let trigger_count = completed.trigger_count;
-        let record = completed.apply_to(
-            &mut runtime.state,
-            history,
-            scheduler.config.history_limit,
-        );
+        let record =
+            completed.apply_to(&mut runtime.state, history, scheduler.config.history_limit);
         scheduler
             .persist_state_to_legacy(self.store.as_ref(), &runtime.state)
             .await?;

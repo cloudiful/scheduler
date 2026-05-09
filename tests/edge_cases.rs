@@ -1,4 +1,5 @@
-mod support;
+#[path = "support/time.rs"]
+mod time_support;
 
 use scheduler::{
     InMemoryStateStore, InvalidJobKind, Job, Schedule, Scheduler, SchedulerConfig, SchedulerError,
@@ -9,7 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use support::{RefreshDeps, shanghai_after};
+use time_support::shanghai_after;
 
 #[tokio::test]
 async fn blocking_task_panic_surfaces_as_task_join_error() {
@@ -18,10 +19,7 @@ async fn blocking_task_panic_surfaces_as_task_join_error() {
     let job = Job::new(
         "blocking-panic",
         Schedule::Interval(Duration::from_millis(20)),
-        RefreshDeps {
-            label: "panic",
-            seen: AtomicUsize::new(0),
-        },
+        (),
         Task::from_blocking(|_context| -> Result<(), String> { panic!("boom") }),
     )
     .with_max_runs(1);

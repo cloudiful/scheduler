@@ -132,7 +132,9 @@ where
         runtime = backend.refresh_runtime(scheduler, &job, runtime).await?;
         let control = *control_rx.borrow();
 
-        if let Some(stop_signal) = control.stop_signal && active_count == 0 {
+        if let Some(stop_signal) = control.stop_signal
+            && active_count == 0
+        {
             scheduler.emit(SchedulerEvent::SchedulerStopped {
                 job_id: job.job_id.clone(),
                 trigger_count: backend.state(&runtime).trigger_count,
