@@ -60,6 +60,8 @@ mod store;
 mod valkey_coordinated_store;
 #[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
 mod valkey_execution_support;
+#[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
+mod valkey_scripts;
 #[cfg(feature = "valkey-guard")]
 mod valkey_guard;
 #[cfg(feature = "valkey-store")]
