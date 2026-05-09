@@ -9,9 +9,7 @@ use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tokio::time::{Instant, interval_at};
-
-use super::execution::CompletedRun;
+use super::execution::{CompletedRun, renewal_schedule};
 
 #[derive(Debug)]
 pub(super) struct CoordinatedCompletedRun {
@@ -54,10 +52,7 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
         let mut renewal_count = 0u32;
         let mut failed_renewal_count = 0u32;
         let mut lost_reported = false;
-        let mut renewal = Some(interval_at(
-            Instant::now() + lease_config.renew_interval,
-            lease_config.renew_interval,
-        ));
+        let mut renewal = renewal_schedule(Some(lease_config.renew_interval));
 
         let result = loop {
             if let Some(ticker) = renewal.as_mut() {

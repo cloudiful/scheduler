@@ -42,7 +42,7 @@ impl CompletedRun {
     }
 }
 
-pub(crate) fn spawn_trigger<D, G>(
+pub(crate) fn spawn_legacy_trigger<D, G>(
     active: &mut JoinSet<CompletedRun>,
     task: TaskHandler<D>,
     deps: Arc<D>,
@@ -205,6 +205,6 @@ pub(crate) fn spawn_trigger<D, G>(
     });
 }
 
-fn renewal_schedule(renew_interval: Option<Duration>) -> Option<tokio::time::Interval> {
+pub(crate) fn renewal_schedule(renew_interval: Option<Duration>) -> Option<tokio::time::Interval> {
     renew_interval.map(|duration| interval_at(Instant::now() + duration, duration))
 }

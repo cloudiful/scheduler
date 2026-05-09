@@ -1,17 +1,16 @@
-use super::control::ControlSignal;
-use super::coordinated_execution::{apply_completed_coordinated_run, spawn_coordinated_trigger};
+use super::coordinated_execution::{CoordinatedCompletedRun, apply_completed_coordinated_run, spawn_coordinated_trigger};
 use super::engine::Scheduler;
-use super::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
-use super::trigger::{PendingTrigger, TriggerDecision, next_trigger};
+use super::overlap::OverlapAction;
+use super::runtime::{SchedulerRuntimeBackend, run_scheduler};
+use super::trigger::PendingTrigger;
 use crate::ExecutionGuard;
 use crate::coordinated_store::{
     CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
     CoordinatedStateStore,
 };
 use crate::error::SchedulerError;
-use crate::model::{Job, JobState, SchedulerReport, TerminalStatePolicy};
-use crate::observer::{SchedulerEvent, SchedulerStopReason, StateLoadSource};
-use chrono::Utc;
+use crate::model::{Job, JobState, RunRecord};
+use crate::observer::{SchedulerEvent, StateLoadSource};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -21,62 +20,185 @@ pub(super) async fn run_coordinated_scheduler<S, G, C, D>(
     job: Job<D>,
     store: &Arc<C>,
     lease_config: CoordinatedLeaseConfig,
-) -> Result<SchedulerReport, SchedulerError>
+) -> Result<crate::SchedulerReport, SchedulerError>
 where
     S: crate::StateStore + Send + Sync + 'static,
     G: ExecutionGuard + Send + Sync + 'static,
     C: CoordinatedStateStore + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    let mut runtime =
-        load_or_initialize_coordinated_state(scheduler, store.as_ref(), &job, true).await?;
-    let mut state = runtime.state.clone();
-    let mut history = VecDeque::new();
-    let mut last_skip_reason = None;
-    let mut active = JoinSet::new();
-    let mut active_count = 0usize;
-    let mut queued_trigger: Option<PendingTrigger> = None;
-    let _ = scheduler.control.send(ControlSignal::Running);
-    let mut control_rx = scheduler.control.subscribe();
+    let backend = CoordinatedBackend {
+        store: store.clone(),
+        lease_config,
+    };
+    run_scheduler(scheduler, job, &backend).await
+}
 
-    loop {
-        if matches!(
-            *control_rx.borrow(),
-            ControlSignal::Cancel | ControlSignal::Shutdown
-        ) && active_count == 0
-        {
-            scheduler.emit(SchedulerEvent::SchedulerStopped {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                reason: match *control_rx.borrow() {
-                    ControlSignal::Cancel => SchedulerStopReason::Cancelled,
-                    ControlSignal::Shutdown => SchedulerStopReason::Shutdown,
-                    ControlSignal::Running => SchedulerStopReason::ChannelClosed,
-                },
-            });
-            break;
+#[derive(Clone)]
+struct CoordinatedBackend<C> {
+    store: Arc<C>,
+    lease_config: CoordinatedLeaseConfig,
+}
+
+impl<S, G, C, D> SchedulerRuntimeBackend<S, G, C, D> for CoordinatedBackend<C>
+where
+    S: crate::StateStore + Send + Sync + 'static,
+    G: ExecutionGuard + Send + Sync + 'static,
+    C: CoordinatedStateStore + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Runtime = CoordinatedRuntimeState;
+    type Completed = CoordinatedCompletedRun;
+
+    async fn initialize(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+    ) -> Result<CoordinatedRuntimeState, SchedulerError> {
+        load_or_initialize_coordinated_state(scheduler, self.store.as_ref(), job, true).await
+    }
+
+    async fn refresh_runtime(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        _runtime: CoordinatedRuntimeState,
+    ) -> Result<CoordinatedRuntimeState, SchedulerError> {
+        load_or_initialize_coordinated_state(scheduler, self.store.as_ref(), job, false).await
+    }
+
+    fn state<'a>(&self, runtime: &'a CoordinatedRuntimeState) -> &'a JobState {
+        &runtime.state
+    }
+
+    async fn save_state(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut CoordinatedRuntimeState,
+        state: &JobState,
+    ) -> Result<bool, SchedulerError> {
+        let saved = self
+            .store
+            .save_state(&job.job_id, runtime.revision, state)
+            .await
+            .map_err(|error| {
+                let kind = C::classify_store_error(&error);
+                SchedulerError::store(error, kind)
+            })?;
+        if saved {
+            runtime.revision += 1;
+            runtime.state = state.clone();
         }
+        Ok(saved)
+    }
 
-        if matches!(*control_rx.borrow(), ControlSignal::Running) {
-            runtime = load_or_initialize_coordinated_state(scheduler, store.as_ref(), &job, false)
-                .await?;
-            state = runtime.state.clone();
+    async fn handle_queued_trigger(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut CoordinatedRuntimeState,
+        trigger: PendingTrigger,
+        active: &mut JoinSet<CoordinatedCompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        let claim = self
+            .store
+            .claim_trigger(
+                &job.job_id,
+                &job.execution_resource_id,
+                runtime.revision,
+                CoordinatedPendingTrigger {
+                    scheduled_at: trigger.scheduled_at,
+                    catch_up: trigger.catch_up,
+                    trigger_count: trigger.trigger_count,
+                },
+                &runtime.state,
+                self.lease_config,
+            )
+            .await
+            .map_err(|error| {
+                let kind = C::classify_guard_error(&error);
+                SchedulerError::execution_guard(error, kind)
+            })?;
+        if let Some(claim) = claim {
+            scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
+                job_id: claim.lease.job_id.clone(),
+                resource_id: claim.lease.resource_id.clone(),
+                scope: claim.lease.scope,
+                lease_key: claim.lease.lease_key.clone(),
+                scheduled_at: claim.lease.scheduled_at,
+                catch_up: trigger.catch_up,
+                trigger_count: trigger.trigger_count,
+            });
+            *runtime = claim.state.clone();
+            spawn_coordinated_trigger(
+                scheduler,
+                self.store.clone(),
+                self.lease_config,
+                active,
+                job,
+                claim,
+            )
+            .await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 
-            if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
-                let now = Utc::now();
-                if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
-                    last_skip_reason = Some(reason);
-                    scheduler.emit(SchedulerEvent::RunSkipped {
-                        job_id: job.job_id.clone(),
-                        scheduled_at: trigger.scheduled_at,
-                        catch_up: trigger.catch_up,
-                        trigger_count: trigger.trigger_count,
-                        reason,
-                    });
-                    continue;
-                }
+    async fn try_reclaim_inflight(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut CoordinatedRuntimeState,
+        active: &mut JoinSet<CoordinatedCompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        if let Some(claim) = self
+            .store
+            .reclaim_inflight(&job.job_id, &job.execution_resource_id, self.lease_config)
+            .await
+            .map_err(|error| {
+                let kind = C::classify_guard_error(&error);
+                SchedulerError::execution_guard(error, kind)
+            })?
+        {
+            scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
+                job_id: claim.lease.job_id.clone(),
+                resource_id: claim.lease.resource_id.clone(),
+                scope: claim.lease.scope,
+                lease_key: claim.lease.lease_key.clone(),
+                scheduled_at: claim.lease.scheduled_at,
+                catch_up: claim.trigger.catch_up,
+                trigger_count: claim.trigger.trigger_count,
+            });
+            *runtime = claim.state.clone();
+            spawn_coordinated_trigger(
+                scheduler,
+                self.store.clone(),
+                self.lease_config,
+                active,
+                job,
+                claim,
+            )
+            .await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 
-                let claim = store
+    async fn handle_due_trigger(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut CoordinatedRuntimeState,
+        candidate_state: JobState,
+        _trigger: PendingTrigger,
+        overlap_action: OverlapAction,
+        active: &mut JoinSet<CoordinatedCompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        match overlap_action {
+            OverlapAction::Spawn(trigger) => {
+                let claim = self
+                    .store
                     .claim_trigger(
                         &job.job_id,
                         &job.execution_resource_id,
@@ -86,8 +208,8 @@ where
                             catch_up: trigger.catch_up,
                             trigger_count: trigger.trigger_count,
                         },
-                        &runtime.state,
-                        lease_config,
+                        &candidate_state,
+                        self.lease_config,
                     )
                     .await
                     .map_err(|error| {
@@ -95,6 +217,13 @@ where
                         SchedulerError::execution_guard(error, kind)
                     })?;
                 if let Some(claim) = claim {
+                    *runtime = claim.state.clone();
+                    scheduler.emit(SchedulerEvent::TriggerEmitted {
+                        job_id: job.job_id.clone(),
+                        scheduled_at: trigger.scheduled_at,
+                        catch_up: trigger.catch_up,
+                        trigger_count: trigger.trigger_count,
+                    });
                     scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
                         job_id: claim.lease.job_id.clone(),
                         resource_id: claim.lease.resource_id.clone(),
@@ -106,228 +235,67 @@ where
                     });
                     spawn_coordinated_trigger(
                         scheduler,
-                        store.clone(),
-                        lease_config,
-                        &mut active,
-                        &job,
+                        self.store.clone(),
+                        self.lease_config,
+                        active,
+                        job,
                         claim,
                     )
                     .await;
-                    active_count += 1;
+                    return Ok(true);
                 }
-                continue;
+                Ok(false)
             }
-
-            if let Some(claim) = store
-                .reclaim_inflight(&job.job_id, &job.execution_resource_id, lease_config)
-                .await
-                .map_err(|error| {
-                    let kind = C::classify_guard_error(&error);
-                    SchedulerError::execution_guard(error, kind)
-                })?
-            {
-                scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-                    job_id: claim.lease.job_id.clone(),
-                    resource_id: claim.lease.resource_id.clone(),
-                    scope: claim.lease.scope,
-                    lease_key: claim.lease.lease_key.clone(),
-                    scheduled_at: claim.lease.scheduled_at,
-                    catch_up: claim.trigger.catch_up,
-                    trigger_count: claim.trigger.trigger_count,
-                });
-                spawn_coordinated_trigger(
-                    scheduler,
-                    store.clone(),
-                    lease_config,
-                    &mut active,
-                    &job,
-                    claim,
-                )
-                .await;
-                active_count += 1;
-                continue;
-            }
-
-            let now = Utc::now();
-            if scheduler.should_wait_for_active_replay(&job, active_count) {
-            } else {
-                let mut candidate_state = runtime.state.clone();
-                match next_trigger(&job, &mut candidate_state, now, scheduler.config.timezone)? {
-                    TriggerDecision::Idle => {
-                        state = candidate_state;
-                    }
-                    TriggerDecision::StateAdvanced => {
-                        let saved = store
-                            .save_state(&job.job_id, runtime.revision, &candidate_state)
-                            .await
-                            .map_err(|error| {
-                                let kind = C::classify_store_error(&error);
-                                SchedulerError::store(error, kind)
-                            })?;
-                        if saved {
-                            state = candidate_state;
-                        }
-                    }
-                    TriggerDecision::Trigger(trigger) => {
-                        let now = Utc::now();
-                        if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
-                            let saved = store
-                                .save_state(&job.job_id, runtime.revision, &candidate_state)
-                                .await
-                                .map_err(|error| {
-                                    let kind = C::classify_store_error(&error);
-                                    SchedulerError::store(error, kind)
-                                })?;
-                            if saved {
-                                state = candidate_state;
-                                last_skip_reason = Some(reason);
-                                scheduler.emit(SchedulerEvent::RunSkipped {
-                                    job_id: job.job_id.clone(),
-                                    scheduled_at: trigger.scheduled_at,
-                                    catch_up: trigger.catch_up,
-                                    trigger_count: trigger.trigger_count,
-                                    reason,
-                                });
-                            }
-                            continue;
-                        }
-
-                        match dispatch_trigger(
-                            job.overlap_policy,
-                            active_count,
-                            &mut queued_trigger,
-                            trigger,
-                        ) {
-                            OverlapAction::Spawn(trigger) => {
-                                let claim = store
-                                    .claim_trigger(
-                                        &job.job_id,
-                                        &job.execution_resource_id,
-                                        runtime.revision,
-                                        CoordinatedPendingTrigger {
-                                            scheduled_at: trigger.scheduled_at,
-                                            catch_up: trigger.catch_up,
-                                            trigger_count: trigger.trigger_count,
-                                        },
-                                        &candidate_state,
-                                        lease_config,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        let kind = C::classify_guard_error(&error);
-                                        SchedulerError::execution_guard(error, kind)
-                                    })?;
-                                if let Some(claim) = claim {
-                                    state = claim.state.state.clone();
-                                    scheduler.emit(SchedulerEvent::TriggerEmitted {
-                                        job_id: job.job_id.clone(),
-                                        scheduled_at: trigger.scheduled_at,
-                                        catch_up: trigger.catch_up,
-                                        trigger_count: trigger.trigger_count,
-                                    });
-                                    scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-                                        job_id: claim.lease.job_id.clone(),
-                                        resource_id: claim.lease.resource_id.clone(),
-                                        scope: claim.lease.scope,
-                                        lease_key: claim.lease.lease_key.clone(),
-                                        scheduled_at: claim.lease.scheduled_at,
-                                        catch_up: trigger.catch_up,
-                                        trigger_count: trigger.trigger_count,
-                                    });
-                                    spawn_coordinated_trigger(
-                                        scheduler,
-                                        store.clone(),
-                                        lease_config,
-                                        &mut active,
-                                        &job,
-                                        claim,
-                                    )
-                                    .await;
-                                    active_count += 1;
-                                    continue;
-                                }
-                            }
-                            OverlapAction::QueueUpdated | OverlapAction::Dropped => {
-                                let saved = store
-                                    .save_state(&job.job_id, runtime.revision, &candidate_state)
-                                    .await
-                                    .map_err(|error| {
-                                        let kind = C::classify_store_error(&error);
-                                        SchedulerError::store(error, kind)
-                                    })?;
-                                if saved {
-                                    state = candidate_state;
-                                }
-                                continue;
-                            }
-                        }
-                    }
+            OverlapAction::QueueUpdated | OverlapAction::Dropped => {
+                let saved = self
+                    .store
+                    .save_state(&job.job_id, runtime.revision, &candidate_state)
+                    .await
+                    .map_err(|error| {
+                        let kind = C::classify_store_error(&error);
+                        SchedulerError::store(error, kind)
+                    })?;
+                if saved {
+                    runtime.revision += 1;
+                    runtime.state = candidate_state;
                 }
+                Ok(false)
             }
-        }
-
-        if state.next_run_at.is_none() && active_count == 0 && queued_trigger.is_none() {
-            if matches!(
-                scheduler.config.terminal_state_policy,
-                TerminalStatePolicy::Delete
-            ) {
-                store.delete(&job.job_id).await.map_err(|error| {
-                    let kind = C::classify_store_error(&error);
-                    SchedulerError::store(error, kind)
-                })?;
-                scheduler.emit(SchedulerEvent::TerminalStateDeleted {
-                    job_id: job.job_id.clone(),
-                    trigger_count: state.trigger_count,
-                });
-            }
-            scheduler.emit(SchedulerEvent::SchedulerStopped {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                reason: SchedulerStopReason::Terminal,
-            });
-            break;
-        }
-
-        tokio::select! {
-            maybe_result = active.join_next(), if active_count > 0 => {
-                if let Some(result) = maybe_result {
-                    active_count -= 1;
-                    let completed = result.map_err(SchedulerError::task_join)?;
-                    apply_completed_coordinated_run(scheduler, store.as_ref(), &mut state, &mut history, completed).await?;
-                }
-            }
-            changed = control_rx.changed() => {
-                if changed.is_err() {
-                    scheduler.emit(SchedulerEvent::SchedulerStopped {
-                        job_id: job.job_id.clone(),
-                        trigger_count: state.trigger_count,
-                        reason: SchedulerStopReason::ChannelClosed,
-                    });
-                    break;
-                }
-            }
-            _ = scheduler.sleep_until_next(state.next_run_at), if matches!(*control_rx.borrow(), ControlSignal::Running) && queued_trigger.is_none() && crate::scheduler::trigger_math::next_run_is_in_future(state.next_run_at) => {}
         }
     }
 
-    while let Some(result) = active.join_next().await {
-        let completed = result.map_err(SchedulerError::task_join)?;
+    async fn apply_completed(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        runtime: &mut CoordinatedRuntimeState,
+        history: &mut VecDeque<RunRecord>,
+        completed: CoordinatedCompletedRun,
+    ) -> Result<(), SchedulerError> {
         apply_completed_coordinated_run(
             scheduler,
-            store.as_ref(),
-            &mut state,
-            &mut history,
+            self.store.as_ref(),
+            &mut runtime.state,
+            history,
             completed,
         )
         .await?;
+        runtime.revision += 1;
+        Ok(())
     }
 
-    Ok(SchedulerReport {
-        job_id: job.job_id.clone(),
-        state,
-        history: history.into_iter().collect(),
-        last_skip_reason,
-    })
+    async fn delete_terminal_state(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut CoordinatedRuntimeState,
+    ) -> Result<(), SchedulerError> {
+        self.store.delete(&job.job_id).await.map_err(|error| {
+            let kind = C::classify_store_error(&error);
+            SchedulerError::store(error, kind)
+        })?;
+        runtime.state.next_run_at = None;
+        Ok(())
+    }
 }
 
 async fn load_or_initialize_coordinated_state<S, G, C, D>(

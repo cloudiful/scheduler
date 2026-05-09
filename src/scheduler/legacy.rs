@@ -1,14 +1,13 @@
-use super::control::ControlSignal;
 use super::engine::Scheduler;
-use super::execution::CompletedRun;
-use super::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
-use super::trigger::{PendingTrigger, TriggerDecision, next_trigger};
+use super::execution::{CompletedRun, spawn_legacy_trigger};
+use super::overlap::OverlapAction;
+use super::runtime::{SchedulerRuntimeBackend, run_scheduler};
+use super::trigger::PendingTrigger;
 use crate::error::SchedulerError;
-use crate::model::{Job, JobState, RunRecord, SchedulerReport, TerminalStatePolicy};
-use crate::observer::{SchedulerEvent, SchedulerStopReason, StateLoadSource};
+use crate::model::{Job, JobState, RunRecord};
+use crate::observer::{SchedulerEvent, StateLoadSource};
 use crate::store::StateStore;
 use crate::{ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardScope, ExecutionSlot};
-use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -18,176 +17,166 @@ pub(super) async fn run_legacy_scheduler<S, G, C, D>(
     job: Job<D>,
     store: &Arc<S>,
     guard: &Arc<G>,
-) -> Result<SchedulerReport, SchedulerError>
+) -> Result<crate::SchedulerReport, SchedulerError>
 where
     S: StateStore + Send + Sync + 'static,
     G: ExecutionGuard + Send + Sync + 'static,
     C: crate::CoordinatedStateStore + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    let (mut state, state_is_new) = load_or_initialize_legacy_state(scheduler, store, &job).await?;
-    let mut history = VecDeque::new();
-    let mut last_skip_reason = None;
-    let mut active = JoinSet::new();
-    let mut active_count = 0usize;
-    let mut queued_trigger = None;
-    let _ = scheduler.control.send(ControlSignal::Running);
-    let mut control_rx = scheduler.control.subscribe();
-    if state_is_new {
-        scheduler.persist_state_to_legacy(store, &state).await?;
+    let backend = LegacyBackend {
+        store: store.clone(),
+        guard: guard.clone(),
+    };
+    run_scheduler(scheduler, job, &backend).await
+}
+
+#[derive(Clone)]
+struct LegacyBackend<S, G> {
+    store: Arc<S>,
+    guard: Arc<G>,
+}
+
+struct LegacyRuntime {
+    state: JobState,
+}
+
+impl<S, G, C, D> SchedulerRuntimeBackend<S, G, C, D> for LegacyBackend<S, G>
+where
+    S: StateStore + Send + Sync + 'static,
+    G: ExecutionGuard + Send + Sync + 'static,
+    C: crate::CoordinatedStateStore + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Runtime = LegacyRuntime;
+    type Completed = CompletedRun;
+
+    async fn initialize(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+    ) -> Result<LegacyRuntime, SchedulerError> {
+        let (state, state_is_new) = load_or_initialize_legacy_state(scheduler, self.store.as_ref(), job).await?;
+        if state_is_new {
+            scheduler.persist_state_to_legacy(self.store.as_ref(), &state).await?;
+        }
+        Ok(LegacyRuntime { state })
     }
 
-    loop {
-        if matches!(
-            *control_rx.borrow(),
-            ControlSignal::Cancel | ControlSignal::Shutdown
-        ) && active_count == 0
-        {
-            scheduler.emit(SchedulerEvent::SchedulerStopped {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                reason: match *control_rx.borrow() {
-                    ControlSignal::Cancel => SchedulerStopReason::Cancelled,
-                    ControlSignal::Shutdown => SchedulerStopReason::Shutdown,
-                    ControlSignal::Running => SchedulerStopReason::ChannelClosed,
-                },
-            });
-            break;
-        }
+    async fn refresh_runtime(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        _job: &Job<D>,
+        runtime: LegacyRuntime,
+    ) -> Result<LegacyRuntime, SchedulerError> {
+        Ok(runtime)
+    }
 
-        if matches!(*control_rx.borrow(), ControlSignal::Running) {
-            if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
-                let now = Utc::now();
-                if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
-                    last_skip_reason = Some(reason);
-                    scheduler.emit(SchedulerEvent::RunSkipped {
-                        job_id: job.job_id.clone(),
-                        scheduled_at: trigger.scheduled_at,
-                        catch_up: trigger.catch_up,
-                        trigger_count: trigger.trigger_count,
-                        reason,
-                    });
-                    continue;
-                }
+    fn state<'a>(&self, runtime: &'a LegacyRuntime) -> &'a JobState {
+        &runtime.state
+    }
 
-                if try_spawn_legacy_trigger(scheduler, guard, &job, &mut active, trigger).await? {
-                    active_count += 1;
-                }
-                continue;
-            }
+    async fn save_state(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        _job: &Job<D>,
+        runtime: &mut LegacyRuntime,
+        state: &JobState,
+    ) -> Result<bool, SchedulerError> {
+        runtime.state = state.clone();
+        scheduler
+            .persist_state_to_legacy(self.store.as_ref(), &runtime.state)
+            .await?;
+        Ok(true)
+    }
 
-            let now = Utc::now();
-            if scheduler.should_wait_for_active_replay(&job, active_count) {
-            } else {
-                match next_trigger(&job, &mut state, now, scheduler.config.timezone)? {
-                    TriggerDecision::Idle => {}
-                    TriggerDecision::StateAdvanced => {
-                        scheduler.persist_state_to_legacy(store, &state).await?;
-                    }
-                    TriggerDecision::Trigger(trigger) => {
-                        scheduler.persist_state_to_legacy(store, &state).await?;
-                        let now = Utc::now();
-                        if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
-                            last_skip_reason = Some(reason);
-                            scheduler.emit(SchedulerEvent::RunSkipped {
-                                job_id: job.job_id.clone(),
-                                scheduled_at: trigger.scheduled_at,
-                                catch_up: trigger.catch_up,
-                                trigger_count: trigger.trigger_count,
-                                reason,
-                            });
-                            continue;
-                        }
+    async fn handle_queued_trigger(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        _runtime: &mut LegacyRuntime,
+        trigger: PendingTrigger,
+        active: &mut JoinSet<CompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        try_spawn_legacy_trigger(scheduler, &self.guard, job, active, trigger).await
+    }
 
-                        scheduler.emit(SchedulerEvent::TriggerEmitted {
-                            job_id: job.job_id.clone(),
-                            scheduled_at: trigger.scheduled_at,
-                            catch_up: trigger.catch_up,
-                            trigger_count: trigger.trigger_count,
-                        });
-                        match dispatch_trigger(
-                            job.overlap_policy,
-                            active_count,
-                            &mut queued_trigger,
-                            trigger,
-                        ) {
-                            OverlapAction::Spawn(trigger) => {
-                                if try_spawn_legacy_trigger(
-                                    scheduler,
-                                    guard,
-                                    &job,
-                                    &mut active,
-                                    trigger,
-                                )
-                                .await?
-                                {
-                                    active_count += 1;
-                                }
-                                continue;
-                            }
-                            OverlapAction::QueueUpdated | OverlapAction::Dropped => {
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    async fn try_reclaim_inflight(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        _job: &Job<D>,
+        _runtime: &mut LegacyRuntime,
+        _active: &mut JoinSet<CompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        Ok(false)
+    }
 
-        if state.next_run_at.is_none() && active_count == 0 && queued_trigger.is_none() {
-            if matches!(
-                scheduler.config.terminal_state_policy,
-                TerminalStatePolicy::Delete
-            ) {
-                scheduler
-                    .delete_state_from_legacy(store, &job.job_id)
-                    .await?;
-                scheduler.emit(SchedulerEvent::TerminalStateDeleted {
+    async fn handle_due_trigger(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        runtime: &mut LegacyRuntime,
+        candidate_state: JobState,
+        _trigger: PendingTrigger,
+        overlap_action: OverlapAction,
+        active: &mut JoinSet<CompletedRun>,
+    ) -> Result<bool, SchedulerError> {
+        runtime.state = candidate_state;
+        scheduler
+            .persist_state_to_legacy(self.store.as_ref(), &runtime.state)
+            .await?;
+
+        match overlap_action {
+            OverlapAction::Spawn(trigger) => {
+                scheduler.emit(SchedulerEvent::TriggerEmitted {
                     job_id: job.job_id.clone(),
-                    trigger_count: state.trigger_count,
+                    scheduled_at: trigger.scheduled_at,
+                    catch_up: trigger.catch_up,
+                    trigger_count: trigger.trigger_count,
                 });
+                try_spawn_legacy_trigger(scheduler, &self.guard, job, active, trigger).await
             }
-            scheduler.emit(SchedulerEvent::SchedulerStopped {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                reason: SchedulerStopReason::Terminal,
-            });
-            break;
-        }
-
-        tokio::select! {
-            maybe_result = active.join_next(), if active_count > 0 => {
-                if let Some(result) = maybe_result {
-                    active_count -= 1;
-                    let completed = result.map_err(SchedulerError::task_join)?;
-                    apply_completed_legacy_run(scheduler, store, &mut state, &mut history, completed).await?;
-                }
-            }
-            changed = control_rx.changed() => {
-                if changed.is_err() {
-                    scheduler.emit(SchedulerEvent::SchedulerStopped {
-                        job_id: job.job_id.clone(),
-                        trigger_count: state.trigger_count,
-                        reason: SchedulerStopReason::ChannelClosed,
-                    });
-                    break;
-                }
-            }
-            _ = scheduler.sleep_until_next(state.next_run_at), if matches!(*control_rx.borrow(), ControlSignal::Running) && queued_trigger.is_none() && crate::scheduler::trigger_math::next_run_is_in_future(state.next_run_at) => {}
+            OverlapAction::QueueUpdated | OverlapAction::Dropped => Ok(false),
         }
     }
 
-    while let Some(result) = active.join_next().await {
-        let completed = result.map_err(SchedulerError::task_join)?;
-        apply_completed_legacy_run(scheduler, store, &mut state, &mut history, completed).await?;
+    async fn apply_completed(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        runtime: &mut LegacyRuntime,
+        history: &mut VecDeque<RunRecord>,
+        completed: CompletedRun,
+    ) -> Result<(), SchedulerError> {
+        let trigger_count = completed.trigger_count;
+        let record = completed.apply_to(
+            &mut runtime.state,
+            history,
+            scheduler.config.history_limit,
+        );
+        scheduler
+            .persist_state_to_legacy(self.store.as_ref(), &runtime.state)
+            .await?;
+        scheduler.emit(SchedulerEvent::RunCompleted {
+            job_id: runtime.state.job_id.clone(),
+            scheduled_at: record.scheduled_at,
+            catch_up: record.catch_up,
+            trigger_count,
+            status: record.status,
+            error: record.error,
+        });
+        Ok(())
     }
 
-    Ok(SchedulerReport {
-        job_id: job.job_id.clone(),
-        state,
-        history: history.into_iter().collect(),
-        last_skip_reason,
-    })
+    async fn delete_terminal_state(
+        &self,
+        scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        _runtime: &mut LegacyRuntime,
+    ) -> Result<(), SchedulerError> {
+        scheduler
+            .delete_state_from_legacy(self.store.as_ref(), &job.job_id)
+            .await
+    }
 }
 
 async fn load_or_initialize_legacy_state<S, G, C, D>(
@@ -263,32 +252,6 @@ where
     Ok((state, false))
 }
 
-async fn apply_completed_legacy_run<S, G, C>(
-    scheduler: &Scheduler<S, G, C>,
-    store: &S,
-    state: &mut JobState,
-    history: &mut VecDeque<RunRecord>,
-    completed: CompletedRun,
-) -> Result<(), SchedulerError>
-where
-    S: StateStore + Send + Sync + 'static,
-    G: ExecutionGuard + Send + Sync + 'static,
-    C: crate::CoordinatedStateStore + Send + Sync + 'static,
-{
-    let trigger_count = completed.trigger_count;
-    let record = completed.apply_to(state, history, scheduler.config.history_limit);
-    scheduler.persist_state_to_legacy(store, state).await?;
-    scheduler.emit(SchedulerEvent::RunCompleted {
-        job_id: state.job_id.clone(),
-        scheduled_at: record.scheduled_at,
-        catch_up: record.catch_up,
-        trigger_count,
-        status: record.status,
-        error: record.error,
-    });
-    Ok(())
-}
-
 async fn try_spawn_legacy_trigger<S, G, C, D>(
     scheduler: &Scheduler<S, G, C>,
     guard: &Arc<G>,
@@ -339,7 +302,7 @@ where
         trigger_count: trigger.trigger_count,
     });
 
-    crate::scheduler::execution::spawn_trigger(
+    spawn_legacy_trigger(
         active,
         job.task.clone(),
         job.deps.clone(),
