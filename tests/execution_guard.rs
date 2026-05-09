@@ -1,197 +1,22 @@
+#[path = "support/execution_guard_fixtures.rs"]
+mod fixtures;
 #[path = "support/time.rs"]
 mod time_support;
 
-#[cfg(feature = "valkey-guard")]
-use chrono::Utc;
+use fixtures::{AcquirePlan, FakeExecutionGuard, RecordingObserver, ReleasePlan, RenewPlan};
 use scheduler::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardErrorKind, ExecutionGuardRenewal,
-    ExecutionLease, ExecutionSlot, InMemoryStateStore, Job, NoopExecutionGuard, OverlapPolicy,
-    Schedule, Scheduler, SchedulerConfig, SchedulerError, SchedulerEvent, SchedulerObserver,
-    SchedulerStopReason, Task,
+    ExecutionGuardErrorKind, InMemoryStateStore, Job, NoopExecutionGuard, OverlapPolicy, Schedule,
+    Scheduler, SchedulerConfig, SchedulerError, SchedulerEvent, SchedulerStopReason, Task,
 };
-use std::collections::VecDeque;
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use time_support::shanghai_after;
 
 #[cfg(feature = "valkey-guard")]
-use redis::{AsyncCommands, Client};
-#[cfg(feature = "valkey-guard")]
 use scheduler::{ValkeyExecutionGuard, ValkeyLeaseConfig};
-
-#[derive(Clone, Default)]
-struct RecordingObserver {
-    events: Arc<Mutex<Vec<SchedulerEvent>>>,
-}
-
-impl RecordingObserver {
-    fn snapshot(&self) -> Vec<SchedulerEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-impl SchedulerObserver for RecordingObserver {
-    fn on_event(&self, event: &SchedulerEvent) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FakeGuardError {
-    kind: ExecutionGuardErrorKind,
-    message: &'static str,
-}
-
-impl Display for FakeGuardError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message)
-    }
-}
-
-impl Error for FakeGuardError {}
-
-#[derive(Debug, Clone, Copy)]
-enum AcquirePlan {
-    Acquired,
-    Contended,
-    Error(ExecutionGuardErrorKind, &'static str),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-enum RenewPlan {
-    Renewed,
-    Lost,
-    Error(ExecutionGuardErrorKind, &'static str),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ReleasePlan {
-    Ok,
-    Error(ExecutionGuardErrorKind, &'static str),
-}
-
-#[derive(Clone, Default)]
-struct FakeExecutionGuard {
-    state: Arc<Mutex<FakeExecutionGuardState>>,
-    renew_every: Option<Duration>,
-}
-
-#[derive(Default)]
-struct FakeExecutionGuardState {
-    acquire_plan: VecDeque<AcquirePlan>,
-    renew_plan: VecDeque<RenewPlan>,
-    release_plan: VecDeque<ReleasePlan>,
-    slots: Vec<ExecutionSlot>,
-    acquire_count: usize,
-}
-
-impl FakeExecutionGuard {
-    fn new(
-        acquire_plan: impl IntoIterator<Item = AcquirePlan>,
-        renew_plan: impl IntoIterator<Item = RenewPlan>,
-        release_plan: impl IntoIterator<Item = ReleasePlan>,
-        renew_every: Option<Duration>,
-    ) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(FakeExecutionGuardState {
-                acquire_plan: acquire_plan.into_iter().collect(),
-                renew_plan: renew_plan.into_iter().collect(),
-                release_plan: release_plan.into_iter().collect(),
-                slots: Vec::new(),
-                acquire_count: 0,
-            })),
-            renew_every,
-        }
-    }
-
-    fn slots(&self) -> Vec<ExecutionSlot> {
-        self.state.lock().unwrap().slots.clone()
-    }
-
-    fn acquire_count(&self) -> usize {
-        self.state.lock().unwrap().acquire_count
-    }
-}
-
-impl ExecutionGuard for FakeExecutionGuard {
-    type Error = FakeGuardError;
-
-    async fn acquire(&self, slot: ExecutionSlot) -> Result<ExecutionGuardAcquire, Self::Error> {
-        let mut state = self.state.lock().unwrap();
-        state.acquire_count += 1;
-        state.slots.push(slot.clone());
-        let plan = state
-            .acquire_plan
-            .pop_front()
-            .unwrap_or(AcquirePlan::Acquired);
-
-        match plan {
-            AcquirePlan::Acquired => Ok(ExecutionGuardAcquire::Acquired(ExecutionLease::new(
-                slot.job_id.clone(),
-                slot.resource_id.clone(),
-                slot.scope,
-                slot.scheduled_at,
-                format!("token-{}", state.acquire_count),
-                match slot.scheduled_at {
-                    Some(scheduled_at) => {
-                        format!("lease:{}:{}", slot.resource_id, scheduled_at.to_rfc3339())
-                    }
-                    None => format!("lease:{}:resource", slot.resource_id),
-                },
-            ))),
-            AcquirePlan::Contended => Ok(ExecutionGuardAcquire::Contended),
-            AcquirePlan::Error(kind, message) => Err(FakeGuardError { kind, message }),
-        }
-    }
-
-    async fn renew(&self, _lease: &ExecutionLease) -> Result<ExecutionGuardRenewal, Self::Error> {
-        let plan = self
-            .state
-            .lock()
-            .unwrap()
-            .renew_plan
-            .pop_front()
-            .unwrap_or(RenewPlan::Renewed);
-
-        match plan {
-            RenewPlan::Renewed => Ok(ExecutionGuardRenewal::Renewed),
-            RenewPlan::Lost => Ok(ExecutionGuardRenewal::Lost),
-            RenewPlan::Error(kind, message) => Err(FakeGuardError { kind, message }),
-        }
-    }
-
-    async fn release(&self, _lease: &ExecutionLease) -> Result<(), Self::Error> {
-        let plan = self
-            .state
-            .lock()
-            .unwrap()
-            .release_plan
-            .pop_front()
-            .unwrap_or(ReleasePlan::Ok);
-
-        match plan {
-            ReleasePlan::Ok => Ok(()),
-            ReleasePlan::Error(kind, message) => Err(FakeGuardError { kind, message }),
-        }
-    }
-
-    fn classify_error(error: &Self::Error) -> ExecutionGuardErrorKind
-    where
-        Self: Sized,
-    {
-        error.kind
-    }
-
-    fn renew_interval(&self, _lease: &ExecutionLease) -> Option<Duration> {
-        self.renew_every
-    }
-}
 
 #[tokio::test]
 async fn noop_execution_guard_keeps_existing_behavior() {
@@ -462,6 +287,63 @@ async fn lost_renewal_stops_future_triggers_and_shuts_down() {
     }));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renew_error_stops_future_triggers_and_shuts_down() {
+    let observer = RecordingObserver::default();
+    let scheduler = Scheduler::with_observer_and_execution_guard(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+        observer.clone(),
+        FakeExecutionGuard::new(
+            [],
+            [RenewPlan::Error(
+                ExecutionGuardErrorKind::Connection,
+                "renew connection failed",
+            )],
+            [],
+            Some(Duration::from_millis(20)),
+        ),
+    );
+
+    let report = scheduler
+        .run(
+            Job::without_deps(
+                "guard-renew-error",
+                Schedule::Interval(Duration::from_millis(10)),
+                Task::from_async(|_| async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok(())
+                }),
+            )
+            .with_max_runs(10),
+        )
+        .await
+        .unwrap();
+
+    let events = observer.snapshot();
+    assert_eq!(report.history.len(), 1);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::ExecutionGuardRenewFailed { job_id, error, .. }
+                if job_id == "guard-renew-error" && error == "renew connection failed"
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::ExecutionGuardLost { job_id, .. } if job_id == "guard-renew-error"
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::SchedulerStopped { job_id, reason, .. }
+                if job_id == "guard-renew-error" && *reason == SchedulerStopReason::Shutdown
+        )
+    }));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allow_parallel_uses_distinct_slots_per_occurrence() {
     let guard = FakeExecutionGuard::new([], [], [], None);
@@ -586,139 +468,4 @@ async fn same_occurrence_runs_on_only_one_scheduler_instance() {
 
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(first.history.len() + second.history.len(), 1);
-}
-
-#[cfg(feature = "valkey-guard")]
-#[tokio::test]
-#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
-async fn different_occurrences_for_same_job_can_both_acquire() {
-    let url = valkey_url().expect("SCHEDULER_VALKEY_URL must be set");
-    let prefix = format!("scheduler:test:execution-guard:{}:", unique_id());
-    let guard = ValkeyExecutionGuard::with_prefix(
-        &url,
-        prefix.clone(),
-        ValkeyLeaseConfig {
-            ttl: Duration::from_secs(5),
-            renew_interval: Duration::from_secs(1),
-        },
-    )
-    .await
-    .expect("failed to create guard");
-    let first_slot = ExecutionSlot::new("shared-job", Utc::now());
-    let second_slot = ExecutionSlot::new("shared-job", Utc::now() + chrono::TimeDelta::seconds(1));
-
-    let first = guard
-        .acquire(first_slot.clone())
-        .await
-        .expect("first acquire failed");
-    let second = guard
-        .acquire(second_slot.clone())
-        .await
-        .expect("second acquire failed");
-
-    let ExecutionGuardAcquire::Acquired(first_lease) = first else {
-        panic!("first occurrence should acquire");
-    };
-    let ExecutionGuardAcquire::Acquired(second_lease) = second else {
-        panic!("second occurrence should acquire");
-    };
-
-    assert_ne!(first_lease.lease_key, second_lease.lease_key);
-    guard
-        .release(&first_lease)
-        .await
-        .expect("first release failed");
-    guard
-        .release(&second_lease)
-        .await
-        .expect("second release failed");
-}
-
-#[cfg(feature = "valkey-guard")]
-#[tokio::test]
-#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
-async fn renew_returns_lost_when_token_no_longer_matches() {
-    let url = valkey_url().expect("SCHEDULER_VALKEY_URL must be set");
-    let prefix = format!("scheduler:test:execution-guard:{}:", unique_id());
-    let guard = ValkeyExecutionGuard::with_prefix(
-        &url,
-        prefix.clone(),
-        ValkeyLeaseConfig {
-            ttl: Duration::from_secs(5),
-            renew_interval: Duration::from_secs(1),
-        },
-    )
-    .await
-    .expect("failed to create guard");
-    let slot = ExecutionSlot::new("shared-job", Utc::now());
-    let lease = match guard.acquire(slot).await.expect("acquire failed") {
-        ExecutionGuardAcquire::Acquired(lease) => lease,
-        ExecutionGuardAcquire::Contended => panic!("expected acquired lease"),
-    };
-    let client = Client::open(url).expect("invalid valkey url");
-    let mut connection = client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to get valkey connection");
-
-    let _: () = connection
-        .set(&lease.lease_key, "other-token")
-        .await
-        .expect("failed to replace token");
-
-    let renewal = guard.renew(&lease).await.expect("renew should not error");
-    assert_eq!(renewal, ExecutionGuardRenewal::Lost);
-
-    let _: usize = connection
-        .del(&lease.lease_key)
-        .await
-        .expect("cleanup failed");
-}
-
-#[cfg(feature = "valkey-guard")]
-#[tokio::test]
-#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
-async fn release_only_deletes_the_owner_token() {
-    let url = valkey_url().expect("SCHEDULER_VALKEY_URL must be set");
-    let prefix = format!("scheduler:test:execution-guard:{}:", unique_id());
-    let guard = ValkeyExecutionGuard::with_prefix(
-        &url,
-        prefix.clone(),
-        ValkeyLeaseConfig {
-            ttl: Duration::from_secs(5),
-            renew_interval: Duration::from_secs(1),
-        },
-    )
-    .await
-    .expect("failed to create guard");
-    let slot = ExecutionSlot::new("shared-job", Utc::now());
-    let lease = match guard.acquire(slot).await.expect("acquire failed") {
-        ExecutionGuardAcquire::Acquired(lease) => lease,
-        ExecutionGuardAcquire::Contended => panic!("expected acquired lease"),
-    };
-    let client = Client::open(url).expect("invalid valkey url");
-    let mut connection = client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to get valkey connection");
-
-    let _: () = connection
-        .set(&lease.lease_key, "foreign-token")
-        .await
-        .expect("failed to replace token");
-    guard
-        .release(&lease)
-        .await
-        .expect("release should not error");
-
-    let remaining: Option<String> = connection
-        .get(&lease.lease_key)
-        .await
-        .expect("failed to inspect lease key");
-    assert_eq!(remaining.as_deref(), Some("foreign-token"));
-
-    let _: usize = connection
-        .del(&lease.lease_key)
-        .await
-        .expect("cleanup failed");
 }

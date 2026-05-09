@@ -1,7 +1,9 @@
 use super::engine::Scheduler;
-use super::execution::{CompletedRun, spawn_legacy_trigger};
+use super::execution::{CompletedRun, apply_completed_run, spawn_legacy_trigger};
 use super::overlap::OverlapAction;
 use super::runtime::{SchedulerRuntimeBackend, run_scheduler};
+use super::runtime_events::{execution_guard_acquired, run_completed, trigger_emitted};
+use super::state_loading::{emit_state_loaded, emit_state_repaired, initial_runtime_state};
 use super::trigger::PendingTrigger;
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
@@ -143,12 +145,12 @@ where
 
         match overlap_action {
             OverlapAction::Spawn(trigger) => {
-                scheduler.emit(SchedulerEvent::TriggerEmitted {
-                    job_id: job.job_id.clone(),
-                    scheduled_at: trigger.scheduled_at,
-                    catch_up: trigger.catch_up,
-                    trigger_count: trigger.trigger_count,
-                });
+                scheduler.emit(trigger_emitted(
+                    &job.job_id,
+                    trigger.scheduled_at,
+                    trigger.catch_up,
+                    trigger.trigger_count,
+                ));
                 try_spawn_legacy_trigger(scheduler, &self.guard, job, active, trigger).await
             }
             OverlapAction::QueueUpdated | OverlapAction::Dropped => Ok(false),
@@ -162,20 +164,16 @@ where
         history: &mut VecDeque<RunRecord>,
         completed: CompletedRun,
     ) -> Result<(), SchedulerError> {
-        let trigger_count = completed.trigger_count;
-        let record =
-            completed.apply_to(&mut runtime.state, history, scheduler.config.history_limit);
+        let (record, trigger_count) = apply_completed_run(
+            &mut runtime.state,
+            history,
+            scheduler.config.history_limit,
+            completed,
+        );
         scheduler
             .persist_state_to_legacy(self.store.as_ref(), &runtime.state)
             .await?;
-        scheduler.emit(SchedulerEvent::RunCompleted {
-            job_id: runtime.state.job_id.clone(),
-            scheduled_at: record.scheduled_at,
-            catch_up: record.catch_up,
-            trigger_count,
-            status: record.status,
-            error: record.error,
-        });
+        scheduler.emit(run_completed(&runtime.state.job_id, &record, trigger_count));
         Ok(())
     }
 
@@ -227,19 +225,8 @@ where
     match scheduler.load_state_from_legacy(store, &job.job_id).await? {
         Some(state) => restore_legacy_state(scheduler, store, job, state).await,
         None => {
-            let state = JobState::new(
-                job.job_id.clone(),
-                crate::scheduler::trigger_math::initial_next_run_at(
-                    job,
-                    scheduler.config.timezone,
-                )?,
-            );
-            scheduler.emit(SchedulerEvent::StateLoaded {
-                job_id: job.job_id.clone(),
-                trigger_count: state.trigger_count,
-                next_run_at: state.next_run_at,
-                source: StateLoadSource::New,
-            });
+            let state = initial_runtime_state(scheduler, job)?;
+            emit_state_loaded(scheduler, &job.job_id, &state, StateLoadSource::New);
             Ok((state, true))
         }
     }
@@ -262,25 +249,10 @@ where
         state.next_run_at =
             crate::scheduler::trigger_math::initial_next_run_at(job, scheduler.config.timezone)?;
         scheduler.persist_state_to_legacy(store, &state).await?;
-        scheduler.emit(SchedulerEvent::StateRepaired {
-            job_id: job.job_id.clone(),
-            trigger_count: state.trigger_count,
-            previous_next_run_at,
-            repaired_next_run_at: state.next_run_at,
-        });
-        scheduler.emit(SchedulerEvent::StateLoaded {
-            job_id: job.job_id.clone(),
-            trigger_count: state.trigger_count,
-            next_run_at: state.next_run_at,
-            source: StateLoadSource::Repaired,
-        });
+        emit_state_repaired(scheduler, &job.job_id, &state, previous_next_run_at);
+        emit_state_loaded(scheduler, &job.job_id, &state, StateLoadSource::Repaired);
     } else {
-        scheduler.emit(SchedulerEvent::StateLoaded {
-            job_id: job.job_id.clone(),
-            trigger_count: state.trigger_count,
-            next_run_at: state.next_run_at,
-            source: StateLoadSource::Restored,
-        });
+        emit_state_loaded(scheduler, &job.job_id, &state, StateLoadSource::Restored);
     }
 
     Ok((state, false))
@@ -326,15 +298,11 @@ where
         return Ok(false);
     };
 
-    scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-        job_id: job.job_id.clone(),
-        resource_id: lease.resource_id.clone(),
-        scope: lease.scope,
-        lease_key: lease.lease_key.clone(),
-        scheduled_at: lease.scheduled_at,
-        catch_up: trigger.catch_up,
-        trigger_count: trigger.trigger_count,
-    });
+    scheduler.emit(execution_guard_acquired(
+        &lease,
+        trigger.catch_up,
+        trigger.trigger_count,
+    ));
 
     spawn_legacy_trigger(
         active,

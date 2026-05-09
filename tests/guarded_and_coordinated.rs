@@ -2,12 +2,12 @@
 mod fixtures;
 
 use chrono::{Datelike, Utc};
+use fixtures::{FakeCoordinatedStore, InMemoryScopeGuard, RecordingObserver};
 use scheduler::{
     CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedStateStore, ExecutionSlot,
     GuardedRunResult, GuardedRunner, Job, JobState, JobTimeWindow, OverlapPolicy, PauseScope,
     RunSkipReason, Schedule, Scheduler, SchedulerConfig, SchedulerEvent, Task,
 };
-use fixtures::{FakeCoordinatedStore, InMemoryScopeGuard, RecordingObserver};
 use std::sync::Arc;
 use std::time::Duration;
 

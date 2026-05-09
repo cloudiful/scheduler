@@ -1,6 +1,7 @@
 use super::control::StopSignal;
 use super::engine::Scheduler;
-use super::execution::{CompletedRun, renewal_schedule};
+use super::execution::{CompletedRun, apply_completed_run, renewal_schedule};
+use super::runtime_events::{execution_guard_released, run_completed};
 use crate::coordinated_store::{CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedStateStore};
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
@@ -178,35 +179,27 @@ where
     G: ExecutionGuard + Send + Sync + 'static,
     C: CoordinatedStateStore + Send + Sync + 'static,
 {
-    let trigger_count = completed.completed.trigger_count;
-    let record = completed
-        .completed
-        .apply_to(state, history, scheduler.config.history_limit);
+    let CoordinatedCompletedRun {
+        completed,
+        lease,
+        revision,
+    } = completed;
+    let (record, trigger_count) =
+        apply_completed_run(state, history, scheduler.config.history_limit, completed);
     let saved = store
-        .complete(&state.job_id, completed.revision, &completed.lease, state)
+        .complete(&state.job_id, revision, &lease, state)
         .await
         .map_err(|error| {
             let kind = C::classify_store_error(&error);
             SchedulerError::store(error, kind)
         })?;
     if saved {
-        scheduler.emit(SchedulerEvent::ExecutionGuardReleased {
-            job_id: completed.lease.job_id.clone(),
-            resource_id: completed.lease.resource_id.clone(),
-            scope: completed.lease.scope,
-            lease_key: completed.lease.lease_key.clone(),
-            scheduled_at: completed.lease.scheduled_at,
-            catch_up: record.catch_up,
+        scheduler.emit(execution_guard_released(
+            &lease,
+            record.catch_up,
             trigger_count,
-        });
+        ));
     }
-    scheduler.emit(SchedulerEvent::RunCompleted {
-        job_id: state.job_id.clone(),
-        scheduled_at: record.scheduled_at,
-        catch_up: record.catch_up,
-        trigger_count,
-        status: record.status,
-        error: record.error,
-    });
+    scheduler.emit(run_completed(&state.job_id, &record, trigger_count));
     Ok(())
 }

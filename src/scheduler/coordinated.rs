@@ -4,6 +4,8 @@ use super::coordinated_execution::{
 use super::engine::Scheduler;
 use super::overlap::OverlapAction;
 use super::runtime::{SchedulerRuntimeBackend, run_scheduler};
+use super::runtime_events::{execution_guard_acquired, trigger_emitted};
+use super::state_loading::{emit_state_loaded, emit_state_repaired, initial_runtime_state};
 use super::trigger::PendingTrigger;
 use crate::ExecutionGuard;
 use crate::coordinated_store::{
@@ -12,7 +14,7 @@ use crate::coordinated_store::{
 };
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
-use crate::observer::{PauseScope, SchedulerEvent, StateLoadSource};
+use crate::observer::{PauseScope, StateLoadSource};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -131,15 +133,11 @@ where
                 SchedulerError::execution_guard(error, kind)
             })?;
         if let Some(claim) = claim {
-            scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-                job_id: claim.lease.job_id.clone(),
-                resource_id: claim.lease.resource_id.clone(),
-                scope: claim.lease.scope,
-                lease_key: claim.lease.lease_key.clone(),
-                scheduled_at: claim.lease.scheduled_at,
-                catch_up: trigger.catch_up,
-                trigger_count: trigger.trigger_count,
-            });
+            scheduler.emit(execution_guard_acquired(
+                &claim.lease,
+                trigger.catch_up,
+                trigger.trigger_count,
+            ));
             *runtime = claim.state.clone();
             spawn_coordinated_trigger(
                 scheduler,
@@ -171,15 +169,11 @@ where
                 SchedulerError::execution_guard(error, kind)
             })?
         {
-            scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-                job_id: claim.lease.job_id.clone(),
-                resource_id: claim.lease.resource_id.clone(),
-                scope: claim.lease.scope,
-                lease_key: claim.lease.lease_key.clone(),
-                scheduled_at: claim.lease.scheduled_at,
-                catch_up: claim.trigger.catch_up,
-                trigger_count: claim.trigger.trigger_count,
-            });
+            scheduler.emit(execution_guard_acquired(
+                &claim.lease,
+                claim.trigger.catch_up,
+                claim.trigger.trigger_count,
+            ));
             *runtime = claim.state.clone();
             spawn_coordinated_trigger(
                 scheduler,
@@ -228,21 +222,17 @@ where
                     })?;
                 if let Some(claim) = claim {
                     *runtime = claim.state.clone();
-                    scheduler.emit(SchedulerEvent::TriggerEmitted {
-                        job_id: job.job_id.clone(),
-                        scheduled_at: trigger.scheduled_at,
-                        catch_up: trigger.catch_up,
-                        trigger_count: trigger.trigger_count,
-                    });
-                    scheduler.emit(SchedulerEvent::ExecutionGuardAcquired {
-                        job_id: claim.lease.job_id.clone(),
-                        resource_id: claim.lease.resource_id.clone(),
-                        scope: claim.lease.scope,
-                        lease_key: claim.lease.lease_key.clone(),
-                        scheduled_at: claim.lease.scheduled_at,
-                        catch_up: trigger.catch_up,
-                        trigger_count: trigger.trigger_count,
-                    });
+                    scheduler.emit(trigger_emitted(
+                        &job.job_id,
+                        trigger.scheduled_at,
+                        trigger.catch_up,
+                        trigger.trigger_count,
+                    ));
+                    scheduler.emit(execution_guard_acquired(
+                        &claim.lease,
+                        trigger.catch_up,
+                        trigger.trigger_count,
+                    ));
                     spawn_coordinated_trigger(
                         scheduler,
                         self.store.clone(),
@@ -344,10 +334,7 @@ where
     C: CoordinatedStateStore + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    let initial_state = JobState::new(
-        job.job_id.clone(),
-        crate::scheduler::trigger_math::initial_next_run_at(job, scheduler.config.timezone)?,
-    );
+    let initial_state = initial_runtime_state(scheduler, job)?;
     let mut runtime = store
         .load_or_initialize(&job.job_id, initial_state)
         .await
@@ -369,32 +356,27 @@ where
             })?;
         if saved {
             runtime.revision += 1;
-            scheduler.emit(SchedulerEvent::StateRepaired {
-                job_id: job.job_id.clone(),
-                trigger_count: runtime.state.trigger_count,
-                previous_next_run_at,
-                repaired_next_run_at: runtime.state.next_run_at,
-            });
+            emit_state_repaired(scheduler, &job.job_id, &runtime.state, previous_next_run_at);
             if emit_load_event {
-                scheduler.emit(SchedulerEvent::StateLoaded {
-                    job_id: job.job_id.clone(),
-                    trigger_count: runtime.state.trigger_count,
-                    next_run_at: runtime.state.next_run_at,
-                    source: StateLoadSource::Repaired,
-                });
+                emit_state_loaded(
+                    scheduler,
+                    &job.job_id,
+                    &runtime.state,
+                    StateLoadSource::Repaired,
+                );
             }
         }
     } else if emit_load_event {
-        scheduler.emit(SchedulerEvent::StateLoaded {
-            job_id: job.job_id.clone(),
-            trigger_count: runtime.state.trigger_count,
-            next_run_at: runtime.state.next_run_at,
-            source: if runtime.revision == 0 {
+        emit_state_loaded(
+            scheduler,
+            &job.job_id,
+            &runtime.state,
+            if runtime.revision == 0 {
                 StateLoadSource::New
             } else {
                 StateLoadSource::Restored
             },
-        });
+        );
     }
 
     Ok(runtime)

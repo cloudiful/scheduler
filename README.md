@@ -9,7 +9,7 @@ Links:
 - docs.rs: <https://docs.rs/cloudiful-scheduler>
 - crates.io: <https://crates.io/crates/cloudiful-scheduler>
 
-Version `0.4.1` exposes:
+Version `0.4.3` exposes:
 
 - explicit schedules via `Schedule::Interval`, `Schedule::AtTimes`, or `Schedule::Cron`
 - job-level execution windows via `JobTimeWindow`
@@ -17,6 +17,7 @@ Version `0.4.1` exposes:
 - overlap control via `OverlapPolicy`
 - persistent job state via `StateStore`
 - optional distributed per-occurrence execution leases via `ExecutionGuard`
+- optional coordinated runtime state via `CoordinatedStateStore`
 - optional terminal-state cleanup via `TerminalStatePolicy`
 - optional runtime observation via `SchedulerObserver`
 - bounded execution history via `SchedulerReport`
@@ -26,6 +27,7 @@ Optional features:
 
 - `valkey-guard` adds `ValkeyExecutionGuard` for Valkey-backed execution leases keyed by `job_id + scheduled_at`.
 - `valkey-store` adds `ValkeyStateStore` for Valkey-backed state persistence.
+  - `ValkeyCoordinatedStateStore` for shared pause/resume state plus expired inflight reclaim across scheduler instances.
   - `ValkeyStateStore::resilient(...)` permanently downgrades to an in-process mirror after connection-class failures.
 
 The scheduler is responsible only for deciding when to trigger work. Domain-specific recovery, cursor logic, and idempotent refresh commands stay in the caller.
@@ -35,7 +37,7 @@ State recovery is keyed only by `job_id`. `StateStore` does not provide distribu
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.4.1" }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.3" }
 chrono = "0.4"
 chrono-tz = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
@@ -45,15 +47,19 @@ Enable Valkey-backed state persistence:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.4.1", features = ["valkey-store"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.3", features = ["valkey-store"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
+
+If multiple scheduler instances must share pause state and reclaim expired
+inflight occurrences, use `ValkeyCoordinatedStateStore` together with
+`Scheduler::with_coordinated_state_store(...)`.
 
 Enable Valkey-backed execution leases:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", version = "0.4.1", features = ["valkey-guard"] }
+scheduler = { package = "cloudiful-scheduler", version = "0.4.3", features = ["valkey-guard"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
@@ -61,7 +67,7 @@ If you need to consume a tagged GitHub release directly:
 
 ```toml
 [dependencies]
-scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.4.1" }
+scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudiful/scheduler.git", tag = "v0.4.3" }
 ```
 
 ## Core concepts
@@ -71,6 +77,7 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Scheduler::with_log_observer(config, store)` adapts runtime events to the `log` crate.
 - `Scheduler::with_execution_guard(config, store, guard)` adds distributed per-occurrence mutual exclusion.
 - `Scheduler::with_observer_and_execution_guard(config, store, observer, guard)` combines both.
+- `Scheduler::with_coordinated_state_store(config, store, lease_config)` enables shared coordinated scheduling on top of a coordinated state store.
 - `Task::from_async(task)` defines an async task from the full `TaskContext`.
 - `Task::from_sync(task)` defines a lightweight synchronous task from the full `TaskContext`.
 - `Task::from_blocking(task)` defines a blocking synchronous task via `tokio::task::spawn_blocking`.
@@ -383,10 +390,22 @@ The Valkey integration tests are marked `ignored` so normal CI stays hermetic. R
 SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-store --test valkey_store -- --ignored
 ```
 
-For the execution guard integration tests:
+For the script-level execution guard semantics:
 
 ```bash
-SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-guard --test execution_guard -- --ignored
+SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-store,valkey-guard --test valkey_guard_scripts -- --ignored --nocapture
+```
+
+For the coordinated runtime store scripts:
+
+```bash
+SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-store,valkey-guard --test valkey_coordinated_scripts -- --ignored --nocapture
+```
+
+For the scheduler-level multi-instance guard integration:
+
+```bash
+SCHEDULER_VALKEY_URL=redis://127.0.0.1:6379/ cargo test --features valkey-guard --test execution_guard -- --ignored --nocapture
 ```
 
 In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external Valkey integration test step in `.gitea/workflows/ci.yml`.

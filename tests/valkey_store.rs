@@ -13,9 +13,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+use tokio::sync::mpsc;
 use valkey_runtime::{connection, unique_id, valkey_url};
 use valkey_state_fixtures::fixture_state;
-use tokio::sync::mpsc;
 
 const DEFAULT_KEY_PREFIX: &str = "scheduler:valkey:job-state:";
 const LEGACY_DEFAULT_KEY_PREFIX: &str = "scheduler:job-state:";

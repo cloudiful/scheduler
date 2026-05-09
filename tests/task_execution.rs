@@ -4,6 +4,7 @@ mod refresh_support;
 mod time_support;
 
 use chrono::Utc;
+use refresh_support::RefreshDeps;
 use scheduler::{
     InMemoryStateStore, Job, RunContext, Schedule, Scheduler, SchedulerConfig, Task, TaskContext,
 };
@@ -12,7 +13,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use refresh_support::RefreshDeps;
 use time_support::shanghai_after;
 
 #[tokio::test]
