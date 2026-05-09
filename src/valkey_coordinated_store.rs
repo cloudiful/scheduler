@@ -21,6 +21,7 @@ const DEFAULT_EXECUTION_KEY_PREFIX: &str = "scheduler:valkey:execution-lease:";
 
 const FIELD_VERSION: &str = "version";
 const FIELD_STATE: &str = "state";
+const FIELD_PAUSED: &str = "paused";
 const FIELD_INFLIGHT_SCHEDULED_AT: &str = "inflight_scheduled_at";
 const FIELD_INFLIGHT_CATCH_UP: &str = "inflight_catch_up";
 const FIELD_INFLIGHT_TRIGGER_COUNT: &str = "inflight_trigger_count";
@@ -113,7 +114,11 @@ impl ValkeyCoordinatedStateStore {
         payload: String,
     ) -> Result<CoordinatedRuntimeState, ValkeyStoreError> {
         let state: JobState = serde_json::from_str(&payload).map_err(ValkeyStoreError::from)?;
-        let runtime = CoordinatedRuntimeState { state, revision: 0 };
+        let runtime = CoordinatedRuntimeState {
+            state,
+            revision: 0,
+            paused: false,
+        };
         self.write_runtime(key, &runtime).await?;
         Ok(runtime)
     }
@@ -136,6 +141,8 @@ impl ValkeyCoordinatedStateStore {
             .arg(runtime.revision)
             .arg(FIELD_STATE)
             .arg(payload)
+            .arg(FIELD_PAUSED)
+            .arg(if runtime.paused { "1" } else { "0" })
             .query_async(&mut connection)
             .await
             .map_err(ValkeyStoreError::from)?;
@@ -190,6 +197,7 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let runtime = CoordinatedRuntimeState {
             state: initial_state,
             revision: 0,
+            paused: false,
         };
         self.write_runtime(&key, &runtime).await?;
         Ok(runtime)
@@ -253,8 +261,12 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
             local inflight_expires_at = tonumber(redis.call('HGET', KEYS[1], ARGV[6]) or '0')
             local state_payload = redis.call('HGET', KEYS[1], ARGV[7])
             local version = tonumber(redis.call('HGET', KEYS[1], ARGV[8]) or '0')
+            local paused = redis.call('HGET', KEYS[1], ARGV[9])
 
             if not scheduled_at or not inflight_resource_id or not inflight_scope then
+                return nil
+            end
+            if paused == '1' or paused == 'true' then
                 return nil
             end
             if inflight_expires_at > tonumber(ARGV[9]) then
@@ -291,6 +303,7 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
         .arg(FIELD_STATE)
         .arg(FIELD_VERSION)
+        .arg(FIELD_PAUSED)
         .arg(now_millis)
         .arg(format!("{}{}:occurrence:", self.execution_key_prefix, resource_id))
         .arg(&token)
@@ -321,7 +334,11 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let trigger_count = values[4].parse::<u32>().unwrap_or(0);
         let scope = parse_scope(&values[5]);
         Ok(Some(CoordinatedClaim {
-            state: CoordinatedRuntimeState { state, revision },
+            state: CoordinatedRuntimeState {
+                state,
+                revision,
+                paused: false,
+            },
             trigger: CoordinatedPendingTrigger {
                 scheduled_at,
                 catch_up,
@@ -361,36 +378,40 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
             r"
             local version = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '-1')
             local inflight = redis.call('HGET', KEYS[1], ARGV[2])
+            local paused = redis.call('HGET', KEYS[1], ARGV[4])
+            if paused == '1' or paused == 'true' then
+                return 0
+            end
             if inflight then
                 local inflight_expires_at = tonumber(redis.call('HGET', KEYS[1], ARGV[3]) or '0')
-                if inflight_expires_at > tonumber(ARGV[4]) then
+                if inflight_expires_at > tonumber(ARGV[5]) then
                     return 0
                 end
                 return 0
             end
-            if version ~= tonumber(ARGV[5]) then
+            if version ~= tonumber(ARGV[6]) then
                 return 0
             end
-            redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[4])
+            redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[5])
             if redis.call('EXISTS', KEYS[2]) == 1 then
                 return 0
             end
-            local ok = redis.call('SET', KEYS[3], ARGV[6], 'NX', 'PX', ARGV[7])
+            local ok = redis.call('SET', KEYS[3], ARGV[7], 'NX', 'PX', ARGV[8])
             if not ok then
                 return 0
             end
-            redis.call('ZADD', KEYS[4], ARGV[8], KEYS[3])
+            redis.call('ZADD', KEYS[4], ARGV[9], KEYS[3])
             redis.call('HSET', KEYS[1],
                 ARGV[1], version + 1,
-                ARGV[9], ARGV[10],
-                ARGV[11], ARGV[12],
-                ARGV[13], ARGV[14],
-                ARGV[15], ARGV[16],
-                ARGV[17], ARGV[18],
-                ARGV[19], ARGV[20],
-                ARGV[21], ARGV[6],
-                ARGV[22], KEYS[3],
-                ARGV[3], ARGV[8]
+                ARGV[10], ARGV[11],
+                ARGV[12], ARGV[13],
+                ARGV[14], ARGV[15],
+                ARGV[16], ARGV[17],
+                ARGV[18], ARGV[19],
+                ARGV[20], ARGV[21],
+                ARGV[22], ARGV[7],
+                ARGV[23], KEYS[3],
+                ARGV[3], ARGV[9]
             )
             return version + 1
             ",
@@ -402,6 +423,7 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         .arg(FIELD_VERSION)
         .arg(FIELD_INFLIGHT_TOKEN)
         .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+        .arg(FIELD_PAUSED)
         .arg(now_millis)
         .arg(revision)
         .arg(&token)
@@ -437,6 +459,7 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
             state: CoordinatedRuntimeState {
                 state: next_state.clone(),
                 revision: new_revision as u64,
+                paused: false,
             },
             trigger: trigger.clone(),
             lease: ExecutionLease::new(
@@ -547,6 +570,54 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         Ok(())
     }
 
+    async fn pause(&self, job_id: &str) -> Result<bool, Self::Error> {
+        let key = self.state_key(job_id);
+        let mut connection = self.connection.clone();
+        let changed: i32 = Script::new(
+            r"
+            local paused = redis.call('HGET', KEYS[1], ARGV[1])
+            if not paused then
+                return 0
+            end
+            if paused == '1' or paused == 'true' then
+                return 0
+            end
+            redis.call('HSET', KEYS[1], ARGV[1], '1')
+            return 1
+            ",
+        )
+        .key(key)
+        .arg(FIELD_PAUSED)
+        .invoke_async(&mut connection)
+        .await
+        .map_err(ValkeyStoreError::from)?;
+        Ok(changed == 1)
+    }
+
+    async fn resume(&self, job_id: &str) -> Result<bool, Self::Error> {
+        let key = self.state_key(job_id);
+        let mut connection = self.connection.clone();
+        let changed: i32 = Script::new(
+            r"
+            local paused = redis.call('HGET', KEYS[1], ARGV[1])
+            if not paused then
+                return 0
+            end
+            if paused == '0' or paused == 'false' then
+                return 0
+            end
+            redis.call('HSET', KEYS[1], ARGV[1], '0')
+            return 1
+            ",
+        )
+        .key(key)
+        .arg(FIELD_PAUSED)
+        .invoke_async(&mut connection)
+        .await
+        .map_err(ValkeyStoreError::from)?;
+        Ok(changed == 1)
+    }
+
     fn classify_store_error(error: &Self::Error) -> StoreErrorKind
     where
         Self: Sized,
@@ -581,9 +652,17 @@ fn parse_runtime_state(
         .get(FIELD_VERSION)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let paused = fields
+        .get(FIELD_PAUSED)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let state = serde_json::from_str(fields.get(FIELD_STATE).map(String::as_str).unwrap_or("{}"))
         .map_err(ValkeyStoreError::from)?;
-    Ok(CoordinatedRuntimeState { state, revision })
+    Ok(CoordinatedRuntimeState {
+        state,
+        revision,
+        paused,
+    })
 }
 
 fn parse_scope(raw: &str) -> ExecutionGuardScope {

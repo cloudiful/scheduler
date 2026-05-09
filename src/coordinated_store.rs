@@ -32,6 +32,7 @@ impl CoordinatedLeaseConfig {
 pub struct CoordinatedRuntimeState {
     pub state: JobState,
     pub revision: u64,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +99,10 @@ pub trait CoordinatedStateStore {
 
     fn delete(&self, job_id: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    fn pause(&self, job_id: &str) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
+    fn resume(&self, job_id: &str) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
     fn classify_store_error(_error: &Self::Error) -> StoreErrorKind
     where
         Self: Sized,
@@ -127,6 +132,7 @@ impl CoordinatedStateStore for NoopCoordinatedStateStore {
         Ok(CoordinatedRuntimeState {
             state: initial_state,
             revision: 0,
+            paused: false,
         })
     }
 
@@ -180,6 +186,14 @@ impl CoordinatedStateStore for NoopCoordinatedStateStore {
 
     async fn delete(&self, _job_id: &str) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    async fn pause(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn resume(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 }
 
@@ -260,6 +274,14 @@ where
 
     async fn delete(&self, job_id: &str) -> Result<(), Self::Error> {
         self.as_ref().delete(job_id).await
+    }
+
+    async fn pause(&self, job_id: &str) -> Result<bool, Self::Error> {
+        self.as_ref().pause(job_id).await
+    }
+
+    async fn resume(&self, job_id: &str) -> Result<bool, Self::Error> {
+        self.as_ref().resume(job_id).await
     }
 
     fn classify_store_error(error: &Self::Error) -> StoreErrorKind

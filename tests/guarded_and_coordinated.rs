@@ -3,7 +3,7 @@ use scheduler::{
     CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
     CoordinatedStateStore, ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal,
     ExecutionGuardScope, ExecutionLease, ExecutionSlot, GuardedRunResult, GuardedRunner, Job,
-    JobTimeWindow, OverlapPolicy, RunSkipReason, Schedule, Scheduler, SchedulerConfig,
+    JobTimeWindow, OverlapPolicy, PauseScope, RunSkipReason, Schedule, Scheduler, SchedulerConfig,
     SchedulerEvent, SchedulerObserver, Task,
 };
 use std::collections::{HashMap, HashSet};
@@ -114,7 +114,11 @@ impl FakeCoordinatedStore {
     fn new(state: JobState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(FakeCoordinatedStoreState {
-                runtime: CoordinatedRuntimeState { state, revision: 0 },
+                runtime: CoordinatedRuntimeState {
+                    state,
+                    revision: 0,
+                    paused: false,
+                },
                 inflight: None,
             })),
         }
@@ -154,6 +158,9 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         lease_config: CoordinatedLeaseConfig,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.runtime.paused {
+            return Ok(None);
+        }
         let Some(inflight) = inner.inflight.clone() else {
             return Ok(None);
         };
@@ -195,7 +202,7 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         lease_config: CoordinatedLeaseConfig,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.runtime.revision != revision || inner.inflight.is_some() {
+        if inner.runtime.paused || inner.runtime.revision != revision || inner.inflight.is_some() {
             return Ok(None);
         }
 
@@ -222,6 +229,20 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
             lease,
             replayed: false,
         }))
+    }
+
+    async fn pause(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let changed = !inner.runtime.paused;
+        inner.runtime.paused = true;
+        Ok(changed)
+    }
+
+    async fn resume(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let changed = inner.runtime.paused;
+        inner.runtime.paused = false;
+        Ok(changed)
     }
 
     async fn renew(
@@ -447,4 +468,113 @@ async fn coordinated_scheduler_skips_outside_time_window() {
             ..
         } if job_id == "coord-window-job" && *reason == RunSkipReason::OutsideTimeWindow
     )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinated_pause_is_shared_across_instances_and_emits_shared_events() {
+    let when = Utc::now() + chrono::TimeDelta::milliseconds(20);
+    let state = JobState::new("coord-shared-pause", Some(when));
+    let store = FakeCoordinatedStore::new(state);
+    let observer = RecordingObserver::default();
+    let lease_config = CoordinatedLeaseConfig {
+        ttl: Duration::from_secs(1),
+        renew_interval: Duration::from_millis(50),
+    };
+    let scheduler_one = Arc::new(Scheduler::with_observer_and_coordinated_state_store(
+        SchedulerConfig::default(),
+        store.clone(),
+        observer.clone(),
+        lease_config,
+    ));
+    let scheduler_two = Arc::new(Scheduler::with_coordinated_state_store(
+        SchedulerConfig::default(),
+        store.clone(),
+        lease_config,
+    ));
+    let handle = scheduler_one.handle();
+    let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = invocations.clone();
+
+    let paused_run = {
+        let scheduler = scheduler_one.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "coord-shared-pause",
+                        Schedule::AtTimes(vec![when.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                        Task::from_async(move |_| {
+                            let seen = seen.clone();
+                            async move {
+                                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_overlap_policy(OverlapPolicy::Forbid)
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(store.inner.lock().unwrap().runtime.paused);
+
+    handle.resume().await.unwrap();
+    let report = paused_run.await.unwrap();
+    assert_eq!(report.history.len(), 1);
+    assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let events = observer.snapshot();
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::SchedulerPaused { job_id, scope, .. }
+                if job_id == "coord-shared-pause" && *scope == PauseScope::Shared
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::SchedulerResumed { job_id, scope, .. }
+                if job_id == "coord-shared-pause" && *scope == PauseScope::Shared
+        )
+    }));
+
+    let second_when = Utc::now() + chrono::TimeDelta::milliseconds(20);
+    {
+        let mut inner = store.inner.lock().unwrap();
+        inner.runtime.state.next_run_at = Some(second_when);
+        inner.runtime.state.trigger_count = 0;
+        inner.runtime.paused = true;
+    }
+    invocations.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let blocked_run = {
+        let scheduler = scheduler_two.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                scheduler.run(
+                    Job::without_deps(
+                        "coord-shared-pause",
+                        Schedule::AtTimes(vec![second_when.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                        Task::from_async(|_| async { Ok(()) }),
+                    )
+                    .with_overlap_policy(OverlapPolicy::Forbid)
+                    .with_max_runs(1),
+                ),
+            )
+            .await
+        })
+    };
+
+    let blocked = blocked_run.await.unwrap();
+    assert!(blocked.is_err());
+    assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

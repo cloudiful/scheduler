@@ -3,15 +3,34 @@ mod support;
 use chrono::{TimeDelta, Utc};
 use chrono_tz::UTC;
 use scheduler::{
-    InMemoryStateStore, Job, JobState, Schedule, Scheduler, SchedulerConfig, StateStore, Task,
+    InMemoryStateStore, Job, JobState, PauseScope, Schedule, Scheduler, SchedulerConfig,
+    SchedulerEvent, SchedulerObserver, StateStore, Task,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
+    Mutex,
 };
 use std::time::Duration;
 use support::shanghai_after;
 use tokio::sync::mpsc;
+
+#[derive(Clone, Default)]
+struct RecordingObserver {
+    events: Arc<Mutex<Vec<SchedulerEvent>>>,
+}
+
+impl RecordingObserver {
+    fn snapshot(&self) -> Vec<SchedulerEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl SchedulerObserver for RecordingObserver {
+    fn on_event(&self, event: &SchedulerEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn state_is_restored_after_graceful_shutdown() {
@@ -376,4 +395,117 @@ async fn incomplete_interval_state_with_missing_next_run_at_is_repaired() {
 
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(report.state.trigger_count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_stops_new_runs_until_resumed_and_emits_events() {
+    let observer = RecordingObserver::default();
+    let scheduler = Arc::new(Scheduler::with_observer(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+        observer.clone(),
+    ));
+    let handle = scheduler.handle();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let seen = invocations.clone();
+
+    let task = {
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "pause-resume-legacy",
+                        Schedule::Interval(Duration::from_millis(30)),
+                        Task::from_async(move |_| {
+                            let seen = seen.clone();
+                            async move {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_max_runs(2),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+
+    handle.resume().await.unwrap();
+    let report = task.await.unwrap();
+    let events = observer.snapshot();
+
+    assert!(!report.history.is_empty());
+    assert!(invocations.load(Ordering::SeqCst) >= 1);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::SchedulerPaused { job_id, scope, .. }
+                if job_id == "pause-resume-legacy" && *scope == PauseScope::Local
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            SchedulerEvent::SchedulerResumed { job_id, scope, .. }
+                if job_id == "pause-resume-legacy" && *scope == PauseScope::Local
+        )
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_does_not_interrupt_running_task() {
+    let scheduler = Arc::new(Scheduler::new(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+    ));
+    let handle = scheduler.handle();
+    let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
+    let (finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let seen = invocations.clone();
+
+    let task = {
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "pause-running-legacy",
+                        Schedule::Interval(Duration::from_millis(10)),
+                        Task::from_async(move |_| {
+                            let started_tx = started_tx.clone();
+                            let finished_tx = finished_tx.clone();
+                            let seen = seen.clone();
+                            async move {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                let _ = started_tx.send(()).await;
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                let _ = finished_tx.send(()).await;
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    let _ = started_rx.recv().await;
+    handle.pause().await.unwrap();
+    let _ = finished_rx.recv().await;
+    handle.shutdown();
+    let report = task.await.unwrap();
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
+    assert_eq!(report.state.trigger_count, 1);
 }

@@ -1,4 +1,4 @@
-use super::control::ControlSignal;
+use super::control::StopSignal;
 use super::engine::Scheduler;
 use crate::coordinated_store::{CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedStateStore};
 use crate::error::SchedulerError;
@@ -87,7 +87,9 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
                                         renewal_count,
                                         failed_renewal_count,
                                     });
-                                    let _ = control.send(ControlSignal::Shutdown);
+                                    let mut next = *control.borrow();
+                                    next.stop_signal = Some(StopSignal::Shutdown);
+                                    let _ = control.send(next);
                                     lost_reported = true;
                                 }
                                 disable_renewal = true;
@@ -118,7 +120,9 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
                                         renewal_count,
                                         failed_renewal_count,
                                     });
-                                    let _ = control.send(ControlSignal::Shutdown);
+                                    let mut next = *control.borrow();
+                                    next.stop_signal = Some(StopSignal::Shutdown);
+                                    let _ = control.send(next);
                                     lost_reported = true;
                                 }
                                 disable_renewal = true;

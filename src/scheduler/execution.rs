@@ -2,7 +2,7 @@ use crate::model::{
     JobState, RunContext, RunRecord, RunStatus, TaskContext, TaskHandler, push_history,
 };
 use crate::observer::{SchedulerEvent, SchedulerObserver};
-use crate::scheduler::control::ControlSignal;
+use crate::scheduler::control::{ControlSignal, StopSignal};
 use crate::scheduler::trigger::PendingTrigger;
 use crate::{ExecutionGuard, ExecutionGuardRenewal, ExecutionLease};
 use chrono::Utc;
@@ -109,7 +109,9 @@ pub(crate) fn spawn_legacy_trigger<D, G>(
                                         renewal_count,
                                         failed_renewal_count,
                                     });
-                                    let _ = control.send(ControlSignal::Shutdown);
+                                    let mut next = *control.borrow();
+                                    next.stop_signal = Some(StopSignal::Shutdown);
+                                    let _ = control.send(next);
                                     lost_reported = true;
                                 }
                                 stop_renewal = true;
@@ -140,7 +142,9 @@ pub(crate) fn spawn_legacy_trigger<D, G>(
                                         renewal_count,
                                         failed_renewal_count,
                                     });
-                                    let _ = control.send(ControlSignal::Shutdown);
+                                    let mut next = *control.borrow();
+                                    next.stop_signal = Some(StopSignal::Shutdown);
+                                    let _ = control.send(next);
                                     lost_reported = true;
                                 }
                                 stop_renewal = true;

@@ -52,7 +52,11 @@ impl FakeCoordinatedStore {
     fn new(state: JobState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(FakeCoordinatedStoreState {
-                runtime: CoordinatedRuntimeState { state, revision: 0 },
+                runtime: CoordinatedRuntimeState {
+                    state,
+                    revision: 0,
+                    paused: false,
+                },
                 inflight: None,
             })),
         }
@@ -104,7 +108,7 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         lease_config: CoordinatedLeaseConfig,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.runtime.revision != revision || inner.inflight.is_some() {
+        if inner.runtime.paused || inner.runtime.revision != revision || inner.inflight.is_some() {
             return Ok(None);
         }
 
@@ -176,6 +180,20 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
 
     async fn delete(&self, _job_id: &str) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    async fn pause(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let changed = !inner.runtime.paused;
+        inner.runtime.paused = true;
+        Ok(changed)
+    }
+
+    async fn resume(&self, _job_id: &str) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let changed = inner.runtime.paused;
+        inner.runtime.paused = false;
+        Ok(changed)
     }
 }
 

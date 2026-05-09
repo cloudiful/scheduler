@@ -10,7 +10,7 @@ use crate::coordinated_store::{
 };
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
-use crate::observer::{SchedulerEvent, StateLoadSource};
+use crate::observer::{PauseScope, SchedulerEvent, StateLoadSource};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -69,6 +69,14 @@ where
 
     fn state<'a>(&self, runtime: &'a CoordinatedRuntimeState) -> &'a JobState {
         &runtime.state
+    }
+
+    fn is_paused(&self, runtime: &CoordinatedRuntimeState) -> bool {
+        runtime.paused
+    }
+
+    fn pause_scope(&self) -> PauseScope {
+        PauseScope::Shared
     }
 
     async fn save_state(
@@ -295,6 +303,30 @@ where
         })?;
         runtime.state.next_run_at = None;
         Ok(())
+    }
+
+    async fn pause(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        _runtime: &mut CoordinatedRuntimeState,
+    ) -> Result<bool, SchedulerError> {
+        self.store.pause(&job.job_id).await.map_err(|error| {
+            let kind = C::classify_store_error(&error);
+            SchedulerError::store(error, kind)
+        })
+    }
+
+    async fn resume(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        job: &Job<D>,
+        _runtime: &mut CoordinatedRuntimeState,
+    ) -> Result<bool, SchedulerError> {
+        self.store.resume(&job.job_id).await.map_err(|error| {
+            let kind = C::classify_store_error(&error);
+            SchedulerError::store(error, kind)
+        })
     }
 }
 

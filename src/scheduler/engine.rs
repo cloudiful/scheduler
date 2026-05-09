@@ -1,4 +1,4 @@
-use super::control::{ControlSignal, SchedulerHandle};
+use super::control::{ControlSignal, PauseController, SchedulerHandle};
 use super::coordinated::run_coordinated_scheduler;
 use super::legacy::run_legacy_scheduler;
 use crate::coordinated_store::{
@@ -10,6 +10,10 @@ use crate::observer::{LogObserver, NoopObserver, SchedulerEvent, SchedulerObserv
 use crate::store::{StateStore, StoreEvent};
 use crate::{ExecutionGuard, InMemoryStateStore, NoopExecutionGuard};
 use chrono::Utc;
+use std::future::Future;
+use std::pin::Pin;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -39,6 +43,7 @@ where
     pub(super) backend: SchedulerBackend<S, G, C>,
     pub(super) observer: Arc<dyn SchedulerObserver>,
     pub(super) control: watch::Sender<ControlSignal>,
+    pub(super) active_job_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl<S> Scheduler<S, NoopExecutionGuard, NoopCoordinatedStateStore>
@@ -79,7 +84,7 @@ where
     where
         O: SchedulerObserver,
     {
-        let (control, _) = watch::channel(ControlSignal::Running);
+        let (control, _) = watch::channel(ControlSignal::running());
         Self {
             config,
             backend: SchedulerBackend::Legacy {
@@ -88,6 +93,7 @@ where
             },
             observer: Arc::new(observer),
             control,
+            active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -113,7 +119,7 @@ where
     where
         O: SchedulerObserver,
     {
-        let (control, _) = watch::channel(ControlSignal::Running);
+        let (control, _) = watch::channel(ControlSignal::running());
         Self {
             config,
             backend: SchedulerBackend::Coordinated {
@@ -122,6 +128,7 @@ where
             },
             observer: Arc::new(observer),
             control,
+            active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -132,6 +139,15 @@ where
     G: ExecutionGuard + Send + Sync + 'static,
     C: CoordinatedStateStore + Send + Sync + 'static,
 {
+    fn pause_controller(&self) -> Option<Arc<dyn PauseController>> {
+        match &self.backend {
+            SchedulerBackend::Legacy { .. } => None,
+            SchedulerBackend::Coordinated { store, .. } => Some(Arc::new(CoordinatedPauseController {
+                store: store.clone(),
+            })),
+        }
+    }
+
     pub(super) fn emit(&self, event: SchedulerEvent) {
         self.observer.on_event(&event);
     }
@@ -259,7 +275,11 @@ where
     }
 
     pub fn handle(&self) -> SchedulerHandle {
-        SchedulerHandle::new(self.control.clone())
+        SchedulerHandle::new(
+            self.control.clone(),
+            self.pause_controller(),
+            self.active_job_ids.clone(),
+        )
     }
 
     pub async fn run<D>(&self, job: Job<D>) -> Result<crate::SchedulerReport, SchedulerError>
@@ -267,7 +287,9 @@ where
         D: Send + Sync + 'static,
     {
         let job = self.normalize_job(job)?;
-        match &self.backend {
+        let job_id = job.job_id.clone();
+        self.active_job_ids.lock().unwrap().insert(job_id.clone());
+        let result = match &self.backend {
             SchedulerBackend::Legacy { store, guard } => {
                 run_legacy_scheduler(self, job, store, guard).await
             }
@@ -275,6 +297,41 @@ where
                 store,
                 lease_config,
             } => run_coordinated_scheduler(self, job, store, *lease_config).await,
-        }
+        };
+        self.active_job_ids.lock().unwrap().remove(&job_id);
+        result
+    }
+}
+
+struct CoordinatedPauseController<C> {
+    store: Arc<C>,
+}
+
+impl<C> PauseController for CoordinatedPauseController<C>
+where
+    C: CoordinatedStateStore + Send + Sync + 'static,
+{
+    fn pause<'a>(
+        &'a self,
+        job_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SchedulerError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store.pause(job_id).await.map_err(|error| {
+                let kind = C::classify_store_error(&error);
+                SchedulerError::store(error, kind)
+            })
+        })
+    }
+
+    fn resume<'a>(
+        &'a self,
+        job_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SchedulerError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store.resume(job_id).await.map_err(|error| {
+                let kind = C::classify_store_error(&error);
+                SchedulerError::store(error, kind)
+            })
+        })
     }
 }

@@ -1,9 +1,9 @@
-use super::control::ControlSignal;
+use super::control::{CommandDisposition, SchedulerMode, StopSignal};
 use super::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
 use super::trigger::{PendingTrigger, TriggerDecision, next_trigger};
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord, SchedulerReport};
-use crate::observer::{SchedulerEvent, SchedulerStopReason};
+use crate::observer::{PauseScope, SchedulerEvent, SchedulerStopReason};
 use crate::scheduler::trigger_math::next_run_is_in_future;
 use chrono::Utc;
 use std::collections::VecDeque;
@@ -33,6 +33,10 @@ where
     ) -> impl std::future::Future<Output = Result<Self::Runtime, SchedulerError>> + Send + 'a;
 
     fn state<'a>(&self, runtime: &'a Self::Runtime) -> &'a JobState;
+
+    fn is_paused(&self, runtime: &Self::Runtime) -> bool;
+
+    fn pause_scope(&self) -> PauseScope;
 
     fn save_state<'a>(
         &'a self,
@@ -84,6 +88,20 @@ where
         job: &'a Job<D>,
         runtime: &'a mut Self::Runtime,
     ) -> impl std::future::Future<Output = Result<(), SchedulerError>> + Send + 'a;
+
+    fn pause<'a>(
+        &'a self,
+        scheduler: &'a super::engine::Scheduler<S, G, C>,
+        job: &'a Job<D>,
+        runtime: &'a mut Self::Runtime,
+    ) -> impl std::future::Future<Output = Result<bool, SchedulerError>> + Send + 'a;
+
+    fn resume<'a>(
+        &'a self,
+        scheduler: &'a super::engine::Scheduler<S, G, C>,
+        job: &'a Job<D>,
+        runtime: &'a mut Self::Runtime,
+    ) -> impl std::future::Future<Output = Result<bool, SchedulerError>> + Send + 'a;
 }
 
 pub(super) async fn run_scheduler<S, G, C, D, B>(
@@ -104,30 +122,54 @@ where
     let mut active = JoinSet::new();
     let mut active_count = 0usize;
     let mut queued_trigger = None;
-    let _ = scheduler.control.send(ControlSignal::Running);
+    let mut initial_control = *scheduler.control.borrow();
+    initial_control.stop_signal = None;
+    let _ = scheduler.control.send(initial_control);
     let mut control_rx = scheduler.control.subscribe();
+    let mut last_seen_mode_command = 0u64;
 
     loop {
-        if matches!(
-            *control_rx.borrow(),
-            ControlSignal::Cancel | ControlSignal::Shutdown
-        ) && active_count == 0
-        {
+        runtime = backend.refresh_runtime(scheduler, &job, runtime).await?;
+        let control = *control_rx.borrow();
+
+        if let Some(stop_signal) = control.stop_signal && active_count == 0 {
             scheduler.emit(SchedulerEvent::SchedulerStopped {
                 job_id: job.job_id.clone(),
                 trigger_count: backend.state(&runtime).trigger_count,
-                reason: match *control_rx.borrow() {
-                    ControlSignal::Cancel => SchedulerStopReason::Cancelled,
-                    ControlSignal::Shutdown => SchedulerStopReason::Shutdown,
-                    ControlSignal::Running => SchedulerStopReason::ChannelClosed,
+                reason: match stop_signal {
+                    StopSignal::Cancel => SchedulerStopReason::Cancelled,
+                    StopSignal::Shutdown => SchedulerStopReason::Shutdown,
                 },
             });
             break;
         }
 
-        if matches!(*control_rx.borrow(), ControlSignal::Running) {
-            runtime = backend.refresh_runtime(scheduler, &job, runtime).await?;
+        if control.mode_command_seq != last_seen_mode_command {
+            let changed = match control.command_disposition {
+                CommandDisposition::Apply => match control.desired_mode {
+                    SchedulerMode::Running => backend.resume(scheduler, &job, &mut runtime).await?,
+                    SchedulerMode::Paused => backend.pause(scheduler, &job, &mut runtime).await?,
+                },
+                CommandDisposition::ObserveOnly { changed } => changed,
+            };
+            last_seen_mode_command = control.mode_command_seq;
+            if changed {
+                match control.desired_mode {
+                    SchedulerMode::Paused => scheduler.emit(SchedulerEvent::SchedulerPaused {
+                        job_id: job.job_id.clone(),
+                        trigger_count: backend.state(&runtime).trigger_count,
+                        scope: backend.pause_scope(),
+                    }),
+                    SchedulerMode::Running => scheduler.emit(SchedulerEvent::SchedulerResumed {
+                        job_id: job.job_id.clone(),
+                        trigger_count: backend.state(&runtime).trigger_count,
+                        scope: backend.pause_scope(),
+                    }),
+                }
+            }
+        }
 
+        if control.stop_signal.is_none() && !backend.is_paused(&runtime) {
             if let Some(trigger) = take_queued_if_idle(active_count, &mut queued_trigger) {
                 let now = Utc::now();
                 if let Some(reason) = job.skip_reason_at(now, scheduler.config.timezone) {
@@ -235,7 +277,11 @@ where
         }
 
         let next_run_at = backend.state(&runtime).next_run_at;
-        if next_run_at.is_none() && active_count == 0 && queued_trigger.is_none() {
+        if !backend.is_paused(&runtime)
+            && next_run_at.is_none()
+            && active_count == 0
+            && queued_trigger.is_none()
+        {
             if matches!(
                 scheduler.config.terminal_state_policy,
                 crate::model::TerminalStatePolicy::Delete
@@ -279,7 +325,8 @@ where
                     break;
                 }
             }
-            _ = scheduler.sleep_until_next(next_run_at), if matches!(*control_rx.borrow(), ControlSignal::Running) && queued_trigger.is_none() && next_run_is_in_future(next_run_at) => {}
+            _ = scheduler.sleep_until_next(next_run_at), if control_rx.borrow().stop_signal.is_none() && matches!(control_rx.borrow().desired_mode, SchedulerMode::Running) && !backend.is_paused(&runtime) && queued_trigger.is_none() && next_run_is_in_future(next_run_at) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if backend.is_paused(&runtime) => {}
         }
     }
 

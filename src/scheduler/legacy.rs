@@ -5,7 +5,7 @@ use super::runtime::{SchedulerRuntimeBackend, run_scheduler};
 use super::trigger::PendingTrigger;
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
-use crate::observer::{SchedulerEvent, StateLoadSource};
+use crate::observer::{PauseScope, SchedulerEvent, StateLoadSource};
 use crate::store::StateStore;
 use crate::{ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardScope, ExecutionSlot};
 use std::collections::VecDeque;
@@ -39,6 +39,7 @@ struct LegacyBackend<S, G> {
 
 struct LegacyRuntime {
     state: JobState,
+    paused: bool,
 }
 
 impl<S, G, C, D> SchedulerRuntimeBackend<S, G, C, D> for LegacyBackend<S, G>
@@ -60,7 +61,10 @@ where
         if state_is_new {
             scheduler.persist_state_to_legacy(self.store.as_ref(), &state).await?;
         }
-        Ok(LegacyRuntime { state })
+        Ok(LegacyRuntime {
+            state,
+            paused: false,
+        })
     }
 
     async fn refresh_runtime(
@@ -74,6 +78,14 @@ where
 
     fn state<'a>(&self, runtime: &'a LegacyRuntime) -> &'a JobState {
         &runtime.state
+    }
+
+    fn is_paused(&self, runtime: &LegacyRuntime) -> bool {
+        runtime.paused
+    }
+
+    fn pause_scope(&self) -> PauseScope {
+        PauseScope::Local
     }
 
     async fn save_state(
@@ -176,6 +188,28 @@ where
         scheduler
             .delete_state_from_legacy(self.store.as_ref(), &job.job_id)
             .await
+    }
+
+    async fn pause(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        _job: &Job<D>,
+        runtime: &mut LegacyRuntime,
+    ) -> Result<bool, SchedulerError> {
+        let changed = !runtime.paused;
+        runtime.paused = true;
+        Ok(changed)
+    }
+
+    async fn resume(
+        &self,
+        _scheduler: &Scheduler<S, G, C>,
+        _job: &Job<D>,
+        runtime: &mut LegacyRuntime,
+    ) -> Result<bool, SchedulerError> {
+        let changed = runtime.paused;
+        runtime.paused = false;
+        Ok(changed)
     }
 }
 

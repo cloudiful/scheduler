@@ -20,6 +20,11 @@
 //!   [`Schedule::Cron`] evaluation, and does not rewrite absolute
 //!   [`Schedule::AtTimes`] values.
 //! - Restarts resume by `job_id` from the saved [`JobState::next_run_at`].
+//! - [`SchedulerHandle::pause`] pauses future scheduling without interrupting
+//!   the current run. [`SchedulerHandle::resume`] recomputes immediately and
+//!   applies the existing missed-run policy.
+//! - Pause scope is backend-specific: legacy schedulers pause locally, while
+//!   coordinated schedulers persist a shared pause state per `job_id`.
 //! - Dependency injection here means passing an explicit `deps` value when the
 //!   job is constructed. The scheduler does not auto-resolve parameters.
 //!
@@ -79,7 +84,7 @@ pub use model::{
     SchedulerReport, Task, TaskContext, TerminalStatePolicy, TimeWindowSegment,
 };
 pub use observer::{
-    LogObserver, NoopObserver, SchedulerEvent, SchedulerObserver, SchedulerStopReason,
+    LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,
     StateLoadSource,
 };
 pub use scheduler::{Scheduler, SchedulerHandle};

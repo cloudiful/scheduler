@@ -79,6 +79,8 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
 - `SchedulerHandle::cancel()` stops while waiting.
 - `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
+- `SchedulerHandle::pause().await` stops future triggers without interrupting the current run.
+- `SchedulerHandle::resume().await` wakes the scheduler immediately and resumes with the configured missed-run policy.
 
 Dependency injection in this crate is explicit: you pass a dependency value at job construction time. The scheduler does not auto-resolve arbitrary function parameters.
 
@@ -268,6 +270,7 @@ async fn main() {
 ## Example: recover state across restarts
 
 Share the same store instance across scheduler instances to resume from `next_run_at`.
+`pause()/resume()` follow the same split: legacy schedulers pause only the local instance, while coordinated schedulers persist a shared paused flag per `job_id`.
 
 ```rust
 use std::sync::Arc;

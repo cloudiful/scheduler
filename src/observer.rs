@@ -19,6 +19,12 @@ pub enum SchedulerStopReason {
     ChannelClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseScope {
+    Local,
+    Shared,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerEvent {
     StateLoaded {
@@ -131,6 +137,16 @@ pub enum SchedulerEvent {
     TerminalStateDeleted {
         job_id: String,
         trigger_count: u32,
+    },
+    SchedulerPaused {
+        job_id: String,
+        trigger_count: u32,
+        scope: PauseScope,
+    },
+    SchedulerResumed {
+        job_id: String,
+        trigger_count: u32,
+        scope: PauseScope,
     },
     SchedulerStopped {
         job_id: String,
@@ -332,6 +348,22 @@ impl SchedulerObserver for LogObserver {
             } => info!(
                 "scheduler deleted terminal state job_id={} trigger_count={}",
                 job_id, trigger_count
+            ),
+            SchedulerEvent::SchedulerPaused {
+                job_id,
+                trigger_count,
+                scope,
+            } => info!(
+                "scheduler paused job_id={} trigger_count={} scope={:?}",
+                job_id, trigger_count, scope
+            ),
+            SchedulerEvent::SchedulerResumed {
+                job_id,
+                trigger_count,
+                scope,
+            } => info!(
+                "scheduler resumed job_id={} trigger_count={} scope={:?}",
+                job_id, trigger_count, scope
             ),
             SchedulerEvent::SchedulerStopped {
                 job_id,
