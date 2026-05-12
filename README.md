@@ -11,7 +11,7 @@ Links:
 
 Version `0.4.3` exposes:
 
-- explicit schedules via `Schedule::Interval`, `Schedule::AtTimes`, or `Schedule::Cron`
+- explicit schedules via `Schedule::Interval`, `Schedule::StaggeredInterval`, `Schedule::AtTimes`, or `Schedule::Cron`
 - job-level execution windows via `JobTimeWindow`
 - missed-run handling via `MissedRunPolicy`
 - overlap control via `OverlapPolicy`
@@ -116,6 +116,24 @@ async fn main() {
     let report = scheduler.run(job).await.unwrap();
     println!("history length: {}", report.history.len());
 }
+```
+
+## Example: staggered daily scraper
+
+```rust
+use std::time::Duration;
+
+use scheduler::{InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task};
+
+let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+let job = Job::without_deps(
+    "scrape-example",
+    Schedule::staggered_interval_with_seed(Duration::from_secs(24 * 60 * 60), "example.com"),
+    Task::from_async(|_| async move {
+        // Fetch pages for the same upstream without starting every job at once.
+        Ok(())
+    }),
+);
 ```
 
 ## Example: observe runtime events
@@ -415,6 +433,7 @@ In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external V
 - `Schedule::AtTimes` never executes immediately on startup. The first run waits until the first planned time.
 - `Schedule::AtTimes(Vec::new())` is a valid no-op schedule and exits without running.
 - `Schedule::Interval` schedules the first run at `now + interval`.
+- `Schedule::StaggeredInterval` uses a stable phase derived from the job id or an explicit seed, then repeats by the base interval.
 - `Schedule::Cron` evaluates a standard 5-field expression in `SchedulerConfig::timezone`.
 - `max_runs` applies to interval schedules, explicit `AtTimes` schedules, and cron schedules.
 - `with_max_runs(0)` exits immediately without running any task.

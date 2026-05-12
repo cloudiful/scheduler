@@ -9,6 +9,8 @@
 //! - [`Schedule::AtTimes`] waits until each planned timestamp and treats an
 //!   empty list as a no-op schedule.
 //! - [`Schedule::Interval`] schedules the first run at `now + interval`.
+//! - [`Schedule::StaggeredInterval`] spreads interval jobs by a stable phase
+//!   derived from the job id or an explicit seed.
 //! - [`Schedule::Cron`] evaluates a standard 5-field cron expression in
 //!   [`SchedulerConfig::timezone`].
 //! - [`JobTimeWindow`] can restrict execution by local weekday and time
@@ -83,7 +85,8 @@ pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
     CronSchedule, Job, JobFuture, JobResult, JobState, JobTimeWindow, MissedRunPolicy,
     OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus, Schedule, SchedulerConfig,
-    SchedulerReport, Task, TaskContext, TerminalStatePolicy, TimeWindowSegment,
+    SchedulerReport, StaggeredIntervalSchedule, Task, TaskContext, TerminalStatePolicy,
+    TimeWindowSegment,
 };
 pub use observer::{
     LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,

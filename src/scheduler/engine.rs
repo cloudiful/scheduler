@@ -161,7 +161,10 @@ where
         if state.next_run_at.is_some() {
             return false;
         }
-        if !matches!(job.schedule, crate::Schedule::Interval(_)) {
+        if !matches!(
+            job.schedule,
+            crate::Schedule::Interval(_) | crate::Schedule::StaggeredInterval(_)
+        ) {
             return false;
         }
         match job.max_runs {
@@ -257,6 +260,11 @@ where
         match &mut job.schedule {
             crate::Schedule::Interval(every) => {
                 if every.is_zero() {
+                    return Err(SchedulerError::invalid_zero_interval());
+                }
+            }
+            crate::Schedule::StaggeredInterval(staggered) => {
+                if staggered.every.is_zero() {
                     return Err(SchedulerError::invalid_zero_interval());
                 }
             }

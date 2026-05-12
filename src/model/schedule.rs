@@ -3,10 +3,33 @@ use chrono::{DateTime, Utc};
 use chrono_tz::{Asia::Shanghai, Tz};
 use std::time::Duration;
 
+/// Interval schedule with a stable phase derived from a seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaggeredIntervalSchedule {
+    pub every: Duration,
+    pub seed: Option<String>,
+}
+
+impl StaggeredIntervalSchedule {
+    pub fn new(every: Duration) -> Self {
+        Self { every, seed: None }
+    }
+
+    pub fn with_seed(mut self, seed: impl Into<String>) -> Self {
+        self.seed = Some(seed.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Schedule {
     /// Trigger repeatedly after the given interval.
     Interval(Duration),
+    /// Trigger repeatedly after the given interval with a stable phase.
+    ///
+    /// The first run is aligned to a deterministic phase derived from the
+    /// seed. If no seed is provided, the job id is used.
+    StaggeredInterval(StaggeredIntervalSchedule),
     /// Trigger at the listed wall-clock times.
     ///
     /// The list is sorted before execution starts. An empty list is treated as
@@ -64,6 +87,19 @@ impl Default for SchedulerConfig {
             history_limit: 32,
             terminal_state_policy: TerminalStatePolicy::Retain,
         }
+    }
+}
+
+impl Schedule {
+    /// Create a staggered interval schedule that defaults to the job id as
+    /// the phase seed.
+    pub fn staggered_interval(every: Duration) -> Self {
+        Self::StaggeredInterval(StaggeredIntervalSchedule::new(every))
+    }
+
+    /// Create a staggered interval schedule with an explicit phase seed.
+    pub fn staggered_interval_with_seed(every: Duration, seed: impl Into<String>) -> Self {
+        Self::StaggeredInterval(StaggeredIntervalSchedule::new(every).with_seed(seed))
     }
 }
 

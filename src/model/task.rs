@@ -112,7 +112,8 @@ impl<D> Job<D> {
 
     /// Limit how many triggers this job can consume before it exits.
     ///
-    /// This applies to [`Schedule::Interval`], [`Schedule::AtTimes`], and
+    /// This applies to [`Schedule::Interval`],
+    /// [`Schedule::StaggeredInterval`], [`Schedule::AtTimes`], and
     /// [`Schedule::Cron`].
     /// A value of `0` makes the job exit immediately without running.
     pub fn with_max_runs(mut self, max_runs: u32) -> Self {

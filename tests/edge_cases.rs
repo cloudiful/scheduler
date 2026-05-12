@@ -202,3 +202,23 @@ async fn zero_interval_has_specific_error_kind() {
             if invalid.kind() == InvalidJobKind::ZeroInterval
     ));
 }
+
+#[tokio::test]
+async fn zero_staggered_interval_has_specific_error_kind() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+
+    let error = scheduler
+        .run(Job::without_deps(
+            "zero-staggered-interval",
+            Schedule::staggered_interval(Duration::ZERO),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::ZeroInterval
+    ));
+}
