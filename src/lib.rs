@@ -76,8 +76,8 @@ mod valkey_scripts;
 mod valkey_store;
 
 pub use coordinated_store::{
-    CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
-    CoordinatedStateStore, NoopCoordinatedStateStore,
+    CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedPendingTrigger,
+    CoordinatedRuntimeState, CoordinatedStateStore, NoopCoordinatedStateStore,
 };
 pub use error::{
     ExecutionGuardError, ExecutionGuardErrorKind, InvalidJobError, InvalidJobKind, SchedulerError,
@@ -92,7 +92,7 @@ pub use model::{
     CronSchedule, GroupedIntervalSchedule, IntervalWindow, Job, JobFuture, JobResult, JobState,
     JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus,
     Schedule, SchedulerConfig, SchedulerReport, StaggeredIntervalSchedule, Task, TaskContext,
-    TerminalStatePolicy, TimeWindowSegment, WindowedIntervalSchedule,
+    TerminalStatePolicy, TimeWindowAlignment, TimeWindowSegment, WindowedIntervalSchedule,
 };
 pub use observer::{
     LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,

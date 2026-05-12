@@ -1,53 +1,78 @@
-local field_scheduled_at = ARGV[1]
-local field_catch_up = ARGV[2]
-local field_trigger_count = ARGV[3]
-local field_resource_id = ARGV[4]
-local field_scope = ARGV[5]
-local field_lease_expires_at = ARGV[6]
-local field_state = ARGV[7]
-local field_version = ARGV[8]
-local field_paused = ARGV[9]
-local now_millis = tonumber(ARGV[10])
-local occurrence_prefix = ARGV[11]
-local token = ARGV[12]
-local ttl_millis = ARGV[13]
-local expires_at_millis = ARGV[14]
-local field_token = ARGV[15]
-local field_lease_key = ARGV[16]
+local field_state = ARGV[1]
+local field_version = ARGV[2]
+local field_paused = ARGV[3]
+local now_millis = tonumber(ARGV[4])
+local token = ARGV[5]
+local ttl_millis = ARGV[6]
+local expires_at_millis = ARGV[7]
 
-local scheduled_at = redis.call('HGET', KEYS[1], field_scheduled_at)
-local catch_up = redis.call('HGET', KEYS[1], field_catch_up)
-local trigger_count = redis.call('HGET', KEYS[1], field_trigger_count)
-local inflight_resource_id = redis.call('HGET', KEYS[1], field_resource_id)
-local inflight_scope = redis.call('HGET', KEYS[1], field_scope)
-local inflight_expires_at = tonumber(redis.call('HGET', KEYS[1], field_lease_expires_at) or '0')
-local state_payload = redis.call('HGET', KEYS[1], field_state)
-local version = tonumber(redis.call('HGET', KEYS[1], field_version) or '0')
 local paused = redis.call('HGET', KEYS[1], field_paused)
-
-if not scheduled_at or not inflight_resource_id or not inflight_scope then
-    return nil
-end
 if paused == '1' or paused == 'true' then
     return nil
 end
-if inflight_expires_at > now_millis then
+
+local expired = redis.call('ZRANGEBYSCORE', KEYS[4], '-inf', now_millis, 'LIMIT', 0, 1)
+local lease_key = expired[1]
+local scheduled_at = nil
+local catch_up = nil
+local trigger_count = nil
+local inflight_resource_id = nil
+local inflight_scope = nil
+
+if lease_key then
+    local field_prefix = 'inflight:' .. lease_key .. ':'
+    scheduled_at = redis.call('HGET', KEYS[1], field_prefix .. 'scheduled_at')
+    catch_up = redis.call('HGET', KEYS[1], field_prefix .. 'catch_up')
+    trigger_count = redis.call('HGET', KEYS[1], field_prefix .. 'trigger_count')
+    inflight_resource_id = redis.call('HGET', KEYS[1], field_prefix .. 'resource_id')
+    inflight_scope = redis.call('HGET', KEYS[1], field_prefix .. 'scope')
+end
+
+if not lease_key then
+    scheduled_at = redis.call('HGET', KEYS[1], ARGV[8])
+    catch_up = redis.call('HGET', KEYS[1], ARGV[9])
+    trigger_count = redis.call('HGET', KEYS[1], ARGV[10])
+    inflight_resource_id = redis.call('HGET', KEYS[1], ARGV[11])
+    inflight_scope = redis.call('HGET', KEYS[1], ARGV[12])
+    lease_key = redis.call('HGET', KEYS[1], ARGV[13])
+    local legacy_expires_at = tonumber(redis.call('HGET', KEYS[1], ARGV[14]) or '0')
+    if not lease_key or legacy_expires_at > now_millis then
+        return nil
+    end
+end
+
+if not scheduled_at or not inflight_resource_id or not inflight_scope then
+    if lease_key then
+        redis.call('ZREM', KEYS[4], lease_key)
+    end
     return nil
 end
-redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', now_millis)
-if redis.call('EXISTS', KEYS[2]) == 1 then
+
+local acquired = 0
+if inflight_scope == 'resource' then
+    acquired = acquire_resource(KEYS[2], KEYS[3], now_millis, token, ttl_millis)
+    lease_key = KEYS[2]
+else
+    acquired = acquire_occurrence(KEYS[2], lease_key, KEYS[3], now_millis, token, ttl_millis, expires_at_millis)
+end
+if acquired ~= 1 then
     return nil
 end
-local new_lease_key = occurrence_prefix .. scheduled_at
-local ok = redis.call('SET', new_lease_key, token, 'NX', 'PX', ttl_millis)
-if not ok then
-    return nil
-end
-redis.call('ZADD', KEYS[4], expires_at_millis, new_lease_key)
+
+local field_prefix = 'inflight:' .. lease_key .. ':'
+redis.call('ZADD', KEYS[4], expires_at_millis, lease_key)
 redis.call('HSET', KEYS[1],
-    field_lease_expires_at, expires_at_millis,
-    field_token, token,
-    field_lease_key, new_lease_key,
-    field_version, version + 1
+    field_prefix .. 'scheduled_at', scheduled_at,
+    field_prefix .. 'catch_up', catch_up,
+    field_prefix .. 'trigger_count', trigger_count,
+    field_prefix .. 'resource_id', inflight_resource_id,
+    field_prefix .. 'scope', inflight_scope,
+    field_prefix .. 'token', token,
+    field_prefix .. 'lease_key', lease_key,
+    field_prefix .. 'expires_at', expires_at_millis
 )
-return { tostring(version + 1), state_payload, scheduled_at, catch_up, trigger_count, inflight_scope, new_lease_key, token }
+
+local version = tonumber(redis.call('HGET', KEYS[1], field_version) or '0')
+redis.call('HSET', KEYS[1], field_version, version + 1)
+redis.call('HDEL', KEYS[1], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12], ARGV[13], ARGV[14], ARGV[15])
+return { tostring(version + 1), redis.call('HGET', KEYS[1], field_state), scheduled_at, catch_up, trigger_count, inflight_scope, lease_key, token }

@@ -1,5 +1,7 @@
 use crate::execution_guard::ExecutionGuardScope;
-use crate::model::{JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunSkipReason, Schedule};
+use crate::model::{
+    JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunSkipReason, Schedule, TimeWindowAlignment,
+};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use std::any::type_name;
@@ -60,6 +62,7 @@ pub struct Job<D = ()> {
     pub guard_scope: ExecutionGuardScope,
     pub schedule: Schedule,
     pub time_window: Option<JobTimeWindow>,
+    pub time_window_alignment: TimeWindowAlignment,
     pub max_runs: Option<u32>,
     pub missed_run_policy: MissedRunPolicy,
     pub overlap_policy: OverlapPolicy,
@@ -102,6 +105,7 @@ impl<D> Job<D> {
             guard_scope: ExecutionGuardScope::Occurrence,
             schedule,
             time_window: None,
+            time_window_alignment: TimeWindowAlignment::Disabled,
             max_runs: None,
             missed_run_policy,
             overlap_policy,
@@ -133,6 +137,11 @@ impl<D> Job<D> {
 
     pub fn with_time_window(mut self, time_window: JobTimeWindow) -> Self {
         self.time_window = Some(time_window);
+        self
+    }
+
+    pub fn with_time_window_alignment(mut self) -> Self {
+        self.time_window_alignment = TimeWindowAlignment::AlignToNextWindow;
         self
     }
 
@@ -168,6 +177,7 @@ impl<D> std::fmt::Debug for Job<D> {
             .field("guard_scope", &self.guard_scope)
             .field("schedule", &self.schedule)
             .field("time_window", &self.time_window)
+            .field("time_window_alignment", &self.time_window_alignment)
             .field("max_runs", &self.max_runs)
             .field("missed_run_policy", &self.missed_run_policy)
             .field("overlap_policy", &self.overlap_policy)

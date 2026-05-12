@@ -4,11 +4,12 @@ mod fixtures;
 use chrono::{Datelike, Utc};
 use fixtures::{FakeCoordinatedStore, InMemoryScopeGuard, RecordingObserver};
 use scheduler::{
-    CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedStateStore, ExecutionSlot,
-    GuardedRunResult, GuardedRunner, Job, JobState, JobTimeWindow, OverlapPolicy, PauseScope,
-    RunSkipReason, Schedule, Scheduler, SchedulerConfig, SchedulerEvent, Task,
+    CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedStateStore, ExecutionGuardScope,
+    ExecutionSlot, GuardedRunResult, GuardedRunner, Job, JobState, JobTimeWindow, OverlapPolicy,
+    PauseScope, RunSkipReason, Schedule, Scheduler, SchedulerConfig, SchedulerEvent, Task,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[tokio::test]
@@ -58,6 +59,7 @@ async fn coordinated_store_reclaims_expired_inflight_occurrence() {
             trigger.clone(),
             &runtime.state,
             lease_config,
+            ExecutionGuardScope::Occurrence,
         )
         .await
         .unwrap()
@@ -106,6 +108,109 @@ async fn coordinated_scheduler_runs_basic_at_time_job() {
 
     assert_eq!(report.history.len(), 1);
     assert_eq!(report.state.trigger_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinated_scheduler_allows_parallel_occurrences() {
+    let first = Utc::now() + chrono::TimeDelta::milliseconds(20);
+    let second = first + chrono::TimeDelta::milliseconds(10);
+    let state = JobState::new("coord-parallel", Some(first));
+    let store = FakeCoordinatedStore::new(state);
+    let scheduler = Scheduler::with_coordinated_state_store(
+        SchedulerConfig::default(),
+        store,
+        CoordinatedLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(50),
+        },
+    );
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+
+    let report = scheduler
+        .run(
+            Job::without_deps(
+                "coord-parallel",
+                Schedule::AtTimes(vec![
+                    first.with_timezone(&chrono_tz::Asia::Shanghai),
+                    second.with_timezone(&chrono_tz::Asia::Shanghai),
+                ]),
+                Task::from_async({
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    move |_| {
+                        let active = active.clone();
+                        let max_active = max_active.clone();
+                        async move {
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_active.fetch_max(current, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                }),
+            )
+            .with_overlap_policy(OverlapPolicy::AllowParallel)
+            .with_max_runs(2),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.history.len(), 2);
+    assert!(max_active.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn coordinated_store_resource_scope_blocks_parallel_claims() {
+    let first = Utc::now();
+    let second = first + chrono::TimeDelta::milliseconds(10);
+    let mut state = JobState::new("coord-resource", Some(first));
+    let store = FakeCoordinatedStore::new(state.clone());
+    let config = CoordinatedLeaseConfig {
+        ttl: Duration::from_secs(1),
+        renew_interval: Duration::from_millis(50),
+    };
+    let runtime = store
+        .load_or_initialize("coord-resource", state.clone())
+        .await
+        .unwrap();
+    let first_claim = store
+        .claim_trigger(
+            "coord-resource",
+            "resource",
+            runtime.revision,
+            CoordinatedPendingTrigger {
+                scheduled_at: first,
+                catch_up: false,
+                trigger_count: 1,
+            },
+            &state,
+            config,
+            ExecutionGuardScope::Resource,
+        )
+        .await
+        .unwrap();
+    assert!(first_claim.is_some());
+
+    state.trigger_count = 2;
+    let blocked = store
+        .claim_trigger(
+            "coord-resource",
+            "resource",
+            runtime.revision + 1,
+            CoordinatedPendingTrigger {
+                scheduled_at: second,
+                catch_up: false,
+                trigger_count: 2,
+            },
+            &state,
+            config,
+            ExecutionGuardScope::Resource,
+        )
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
 }
 
 #[tokio::test]

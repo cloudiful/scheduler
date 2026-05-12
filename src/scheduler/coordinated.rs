@@ -136,6 +136,7 @@ where
                 },
                 &runtime.state,
                 self.lease_config,
+                job.guard_scope,
             )
             .await
             .map_err(|error| {
@@ -232,6 +233,7 @@ where
                         },
                         &candidate_state,
                         self.lease_config,
+                        job.guard_scope,
                     )
                     .await
                     .map_err(|error| {

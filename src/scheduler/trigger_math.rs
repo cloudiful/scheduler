@@ -25,7 +25,7 @@ pub(crate) fn initial_next_run_at<D>(
         return Ok(None);
     }
 
-    match &job.schedule {
+    let candidate = match &job.schedule {
         Schedule::Interval(every) => duration_to_delta(*every)
             .ok_or_else(SchedulerError::invalid_interval_out_of_range)
             .and_then(|delta| {
@@ -46,7 +46,11 @@ pub(crate) fn initial_next_run_at<D>(
         }
         Schedule::AtTimes(times) => Ok(times.first().copied().map(utc_time)),
         Schedule::Cron(schedule) => Ok(schedule.next_after(Utc::now(), timezone)),
-    }
+    }?;
+
+    Ok(align_candidate_if_interval_schedule(
+        job, candidate, timezone,
+    ))
 }
 
 pub(crate) fn next_run_is_in_future(next_run_at: Option<DateTime<Utc>>) -> bool {
@@ -143,7 +147,7 @@ where
         return Ok(None);
     }
 
-    match &job.schedule {
+    let candidate = match &job.schedule {
         Schedule::Interval(every) => {
             let delta = duration_to_delta(*every)
                 .ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
@@ -164,7 +168,34 @@ where
         }
         Schedule::AtTimes(times) => Ok(times.get(trigger_count as usize).copied().map(utc_time)),
         Schedule::Cron(schedule) => Ok(schedule.next_after(scheduled_at, timezone)),
+    }?;
+
+    Ok(align_candidate_if_interval_schedule(
+        job, candidate, timezone,
+    ))
+}
+
+fn align_candidate_if_interval_schedule<D>(
+    job: &Job<D>,
+    candidate: Option<DateTime<Utc>>,
+    timezone: Tz,
+) -> Option<DateTime<Utc>> {
+    if !matches!(
+        job.schedule,
+        Schedule::Interval(_)
+            | Schedule::StaggeredInterval(_)
+            | Schedule::GroupedInterval(_)
+            | Schedule::WindowedInterval(_)
+    ) {
+        return candidate;
     }
+
+    super::time_window_alignment::align_to_window(
+        candidate,
+        job.time_window_alignment,
+        job.time_window.as_ref(),
+        timezone,
+    )
 }
 
 pub(crate) fn is_missed(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {

@@ -1,4 +1,4 @@
-use chrono::{NaiveTime, Weekday};
+use chrono::{NaiveTime, TimeDelta, Utc, Weekday};
 use chrono_tz::Asia::Shanghai;
 use scheduler::{
     InMemoryStateStore, Job, JobTimeWindow, Schedule, Scheduler, SchedulerConfig, Task,
@@ -18,6 +18,21 @@ fn all_day_window() -> JobTimeWindow {
             NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
             NaiveTime::from_hms_opt(23, 59, 59).unwrap(),
         )],
+    }
+}
+
+fn upcoming_window() -> JobTimeWindow {
+    let start = (Utc::now() + TimeDelta::seconds(2))
+        .with_timezone(&Shanghai)
+        .time();
+    let end = (Utc::now() + TimeDelta::seconds(4))
+        .with_timezone(&Shanghai)
+        .time();
+
+    JobTimeWindow {
+        timezone: Some(Shanghai),
+        weekdays: Vec::new(),
+        segments: vec![TimeWindowSegment::new(start, end)],
     }
 }
 
@@ -110,4 +125,38 @@ fn market_window_example_uses_public_types() {
         Schedule::WindowedInterval(schedule),
         Schedule::WindowedInterval(_)
     ));
+}
+
+#[tokio::test]
+async fn grouped_interval_can_align_into_time_window() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let seen = invocations.clone();
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.run(
+            Job::without_deps(
+                "grouped-window-align",
+                Schedule::grouped_interval(Duration::from_millis(40), 2, 1),
+                Task::from_async(move |_| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            )
+            .with_time_window(upcoming_window())
+            .with_time_window_alignment()
+            .with_max_runs(1),
+        ),
+    )
+    .await
+    .expect("scheduler run timed out")
+    .unwrap();
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
+    assert!(report.last_skip_reason.is_none());
 }

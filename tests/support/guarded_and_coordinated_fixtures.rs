@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use scheduler::{
-    CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedRuntimeState,
-    CoordinatedStateStore, ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal,
-    ExecutionGuardScope, ExecutionLease, ExecutionSlot, JobState, SchedulerEvent,
-    SchedulerObserver,
+    CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedPendingTrigger,
+    CoordinatedRuntimeState, CoordinatedStateStore, ExecutionGuard, ExecutionGuardAcquire,
+    ExecutionGuardRenewal, ExecutionGuardScope, ExecutionLease, ExecutionSlot, JobState,
+    SchedulerEvent, SchedulerObserver,
 };
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -98,7 +98,7 @@ pub struct FakeCoordinatedStore {
 #[derive(Clone)]
 struct FakeCoordinatedStoreState {
     runtime: CoordinatedRuntimeState,
-    inflight: Option<FakeInflight>,
+    inflight: Vec<FakeInflight>,
 }
 
 #[derive(Clone)]
@@ -118,7 +118,7 @@ impl FakeCoordinatedStore {
                     revision: 0,
                     paused: false,
                 },
-                inflight: None,
+                inflight: Vec::new(),
             })),
         }
     }
@@ -158,7 +158,7 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         state: &JobState,
     ) -> Result<bool, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.runtime.revision != revision || inner.inflight.is_some() {
+        if inner.runtime.revision != revision || !inner.inflight.is_empty() {
             return Ok(false);
         }
         inner.runtime.revision += 1;
@@ -176,28 +176,30 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         if inner.runtime.paused {
             return Ok(None);
         }
-        let Some(inflight) = inner.inflight.clone() else {
+        let Some(position) = inner
+            .inflight
+            .iter()
+            .position(|inflight| inflight.expires_at <= Instant::now())
+        else {
             return Ok(None);
         };
-        if inflight.expires_at > Instant::now() {
-            return Ok(None);
-        }
+        let inflight = inner.inflight[position].clone();
 
         inner.runtime.revision += 1;
         let lease = ExecutionLease::new(
             job_id.to_string(),
             resource_id.to_string(),
-            ExecutionGuardScope::Occurrence,
-            Some(inflight.trigger.scheduled_at),
+            inflight.lease.scope,
+            inflight.lease.scheduled_at,
             "reclaimed-token",
             "reclaimed-lease",
         );
-        inner.inflight = Some(FakeInflight {
+        inner.inflight[position] = FakeInflight {
             trigger: inflight.trigger.clone(),
             resource_id: inflight.resource_id,
             expires_at: Instant::now() + lease_config.ttl,
             lease: lease.clone(),
-        });
+        };
 
         Ok(Some(CoordinatedClaim {
             state: inner.runtime.clone(),
@@ -215,23 +217,46 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         trigger: CoordinatedPendingTrigger,
         next_state: &JobState,
         lease_config: CoordinatedLeaseConfig,
+        scope: ExecutionGuardScope,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.runtime.paused || inner.runtime.revision != revision || inner.inflight.is_some() {
+        if inner.runtime.paused || inner.runtime.revision != revision {
+            return Ok(None);
+        }
+        let resource_busy = inner
+            .inflight
+            .iter()
+            .any(|inflight| inflight.resource_id == resource_id);
+        let same_occurrence_busy = inner.inflight.iter().any(|inflight| {
+            inflight.resource_id == resource_id
+                && inflight.lease.scope == ExecutionGuardScope::Occurrence
+                && inflight.trigger.scheduled_at == trigger.scheduled_at
+        });
+        if matches!(scope, ExecutionGuardScope::Resource) && resource_busy {
+            return Ok(None);
+        }
+        if matches!(scope, ExecutionGuardScope::Occurrence)
+            && (same_occurrence_busy
+                || inner.inflight.iter().any(|inflight| {
+                    inflight.resource_id == resource_id
+                        && inflight.lease.scope == ExecutionGuardScope::Resource
+                }))
+        {
             return Ok(None);
         }
 
         inner.runtime.revision += 1;
         inner.runtime.state = next_state.clone();
+        let token = format!("claim-token-{}", inner.runtime.revision);
         let lease = ExecutionLease::new(
             job_id.to_string(),
             resource_id.to_string(),
-            ExecutionGuardScope::Occurrence,
-            Some(trigger.scheduled_at),
-            "claim-token",
-            "claim-lease",
+            scope,
+            (scope == ExecutionGuardScope::Occurrence).then_some(trigger.scheduled_at),
+            token.clone(),
+            format!("claim-lease-{token}"),
         );
-        inner.inflight = Some(FakeInflight {
+        inner.inflight.push(FakeInflight {
             trigger: trigger.clone(),
             resource_id: resource_id.to_string(),
             expires_at: Instant::now() + lease_config.ttl,
@@ -266,12 +291,13 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
         lease_config: CoordinatedLeaseConfig,
     ) -> Result<ExecutionGuardRenewal, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        let Some(inflight) = inner.inflight.as_mut() else {
+        let Some(inflight) = inner
+            .inflight
+            .iter_mut()
+            .find(|inflight| inflight.lease.token == lease.token)
+        else {
             return Ok(ExecutionGuardRenewal::Lost);
         };
-        if inflight.lease.token != lease.token {
-            return Ok(ExecutionGuardRenewal::Lost);
-        }
         inflight.expires_at = Instant::now() + lease_config.ttl;
         Ok(ExecutionGuardRenewal::Renewed)
     }
@@ -279,32 +305,29 @@ impl CoordinatedStateStore for FakeCoordinatedStore {
     async fn complete(
         &self,
         _job_id: &str,
-        revision: u64,
         lease: &ExecutionLease,
-        state: &JobState,
+        completion: CoordinatedCompletion,
     ) -> Result<bool, Self::Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.runtime.revision != revision {
-            return Ok(false);
-        }
-        if inner
+        let Some(position) = inner
             .inflight
-            .as_ref()
-            .map(|value| value.lease.token.as_str())
-            != Some(lease.token.as_str())
-        {
+            .iter()
+            .position(|value| value.lease.token == lease.token)
+        else {
             return Ok(false);
-        }
+        };
         inner.runtime.revision += 1;
-        inner.runtime.state = state.clone();
-        inner.inflight = None;
+        inner.runtime.state.last_run_at = Some(completion.last_run_at);
+        inner.runtime.state.last_success_at = completion.last_success_at;
+        inner.runtime.state.last_error = completion.last_error;
+        inner.inflight.remove(position);
         Ok(true)
     }
 
     async fn delete(&self, _job_id: &str) -> Result<(), Self::Error> {
         let mut inner = self.inner.lock().unwrap();
         inner.runtime.state.next_run_at = None;
-        inner.inflight = None;
+        inner.inflight.clear();
         Ok(())
     }
 }

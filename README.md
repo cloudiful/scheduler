@@ -88,6 +88,7 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Job::without_deps(job_id, schedule, task)` defines a task with no injected dependencies.
 - `Job::new(job_id, schedule, deps, task)` defines a task with explicit injected `deps`.
 - `Job::with_time_window(window)` restricts execution to local weekdays and time segments.
+- `Job::with_time_window_alignment()` shifts interval-style schedule candidates forward into the configured time window.
 - `Schedule::windowed_interval(default_every)` selects interval frequency by ordered `JobTimeWindow` rules; `None` means no triggers for that period.
 - `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
 - `SchedulerHandle::cancel()` stops while waiting.
@@ -245,6 +246,10 @@ let job = Job::without_deps(
 let report = scheduler.run(job).await.unwrap();
 println!("skip reason: {:?}", report.last_skip_reason);
 ```
+
+Use `with_time_window_alignment()` when interval, staggered interval, or grouped
+interval schedules should move their trigger time into the execution window
+instead of emitting an outside-window trigger that will be skipped.
 
 ## Example: windowed interval frequencies
 

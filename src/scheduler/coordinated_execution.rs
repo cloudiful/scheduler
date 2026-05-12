@@ -2,7 +2,9 @@ use super::control::StopSignal;
 use super::engine::Scheduler;
 use super::execution::{CompletedRun, apply_completed_run, renewal_schedule};
 use super::runtime_events::{execution_guard_released, run_completed};
-use crate::coordinated_store::{CoordinatedClaim, CoordinatedLeaseConfig, CoordinatedStateStore};
+use crate::coordinated_store::{
+    CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedStateStore,
+};
 use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
 use crate::observer::SchedulerEvent;
@@ -16,7 +18,6 @@ use tokio::task::JoinSet;
 pub(super) struct CoordinatedCompletedRun {
     pub(super) completed: CompletedRun,
     pub(super) lease: ExecutionLease,
-    pub(super) revision: u64,
 }
 
 pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
@@ -162,7 +163,6 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
                 trigger_count: claim.trigger.trigger_count,
             },
             lease: claim.lease,
-            revision: claim.state.revision,
         }
     });
 }
@@ -179,15 +179,16 @@ where
     G: ExecutionGuard + Send + Sync + 'static,
     C: CoordinatedStateStore + Send + Sync + 'static,
 {
-    let CoordinatedCompletedRun {
-        completed,
-        lease,
-        revision,
-    } = completed;
+    let CoordinatedCompletedRun { completed, lease } = completed;
     let (record, trigger_count) =
         apply_completed_run(state, history, scheduler.config.history_limit, completed);
+    let completion = CoordinatedCompletion {
+        last_run_at: record.finished_at,
+        last_success_at: (record.status == crate::RunStatus::Success).then_some(record.finished_at),
+        last_error: record.error.clone(),
+    };
     let saved = store
-        .complete(&state.job_id, revision, &lease, state)
+        .complete(&state.job_id, &lease, completion)
         .await
         .map_err(|error| {
             let kind = C::classify_store_error(&error);

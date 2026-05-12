@@ -9,8 +9,9 @@ mod valkey_state_fixtures;
 
 use chrono::Utc;
 use scheduler::{
-    CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedStateStore,
-    ExecutionGuardRenewal, JobState, ValkeyCoordinatedStateStore,
+    CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedPendingTrigger,
+    CoordinatedRuntimeState, CoordinatedStateStore, ExecutionGuardRenewal, ExecutionGuardScope,
+    JobState, ValkeyCoordinatedStateStore,
 };
 use std::time::Duration;
 use valkey_cleanup::delete_matching_prefix;
@@ -55,6 +56,102 @@ async fn new_store(
     (state_prefix, execution_prefix, store, connection)
 }
 
+async fn load_runtime(
+    store: &ValkeyCoordinatedStateStore,
+    job_id: &str,
+    state: JobState,
+) -> CoordinatedRuntimeState {
+    store
+        .load_or_initialize(job_id, state)
+        .await
+        .expect("load_or_initialize failed")
+}
+
+async fn claim_occurrence(
+    store: &ValkeyCoordinatedStateStore,
+    job_id: &str,
+    revision: u64,
+    state: &JobState,
+    scheduled_at: chrono::DateTime<Utc>,
+    trigger_count: u32,
+    config: CoordinatedLeaseConfig,
+) -> CoordinatedClaim {
+    claim_with_scope(
+        store,
+        job_id,
+        revision,
+        state,
+        scheduled_at,
+        trigger_count,
+        config,
+        ExecutionGuardScope::Occurrence,
+    )
+    .await
+}
+
+async fn claim_resource(
+    store: &ValkeyCoordinatedStateStore,
+    job_id: &str,
+    revision: u64,
+    state: &JobState,
+    scheduled_at: chrono::DateTime<Utc>,
+    trigger_count: u32,
+    config: CoordinatedLeaseConfig,
+) -> CoordinatedClaim {
+    claim_with_scope(
+        store,
+        job_id,
+        revision,
+        state,
+        scheduled_at,
+        trigger_count,
+        config,
+        ExecutionGuardScope::Resource,
+    )
+    .await
+}
+
+async fn claim_with_scope(
+    store: &ValkeyCoordinatedStateStore,
+    job_id: &str,
+    revision: u64,
+    state: &JobState,
+    scheduled_at: chrono::DateTime<Utc>,
+    trigger_count: u32,
+    config: CoordinatedLeaseConfig,
+    scope: ExecutionGuardScope,
+) -> CoordinatedClaim {
+    store
+        .claim_trigger(
+            job_id,
+            "resource",
+            revision,
+            CoordinatedPendingTrigger {
+                scheduled_at,
+                catch_up: false,
+                trigger_count,
+            },
+            state,
+            config,
+            scope,
+        )
+        .await
+        .expect("claim_trigger failed")
+        .expect("expected claim")
+}
+
+async fn complete_claim(
+    store: &ValkeyCoordinatedStateStore,
+    job_id: &str,
+    claim: &CoordinatedClaim,
+    completion: CoordinatedCompletion,
+) -> bool {
+    store
+        .complete(job_id, &claim.lease, completion)
+        .await
+        .expect("complete failed")
+}
+
 #[tokio::test]
 #[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
 async fn save_state_script_updates_state_when_not_inflight() {
@@ -64,10 +161,7 @@ async fn save_state_script_updates_state_when_not_inflight() {
     let mut next = initial.clone();
     next.last_error = Some("updated".to_string());
 
-    let runtime = store
-        .load_or_initialize(&job_id, initial)
-        .await
-        .expect("load_or_initialize failed");
+    let runtime = load_runtime(&store, &job_id, initial).await;
     let saved = store
         .save_state(&job_id, runtime.revision, &next)
         .await
@@ -97,27 +191,104 @@ async fn claim_trigger_script_claims_occurrence_in_valkey() {
         trigger_count: 1,
     };
 
-    let runtime = store
-        .load_or_initialize(&job_id, initial.clone())
-        .await
-        .expect("load_or_initialize failed");
-    let claim = store
-        .claim_trigger(
-            &job_id,
-            "resource",
-            runtime.revision,
-            trigger.clone(),
-            &initial,
-            lease_config(),
-        )
-        .await
-        .expect("claim_trigger failed")
-        .expect("expected claim");
+    let runtime = load_runtime(&store, &job_id, initial.clone()).await;
+    let claim = claim_occurrence(
+        &store,
+        &job_id,
+        runtime.revision,
+        &initial,
+        trigger.scheduled_at,
+        trigger.trigger_count,
+        lease_config(),
+    )
+    .await;
 
     assert!(!claim.replayed);
     assert_eq!(claim.trigger, trigger);
     assert_eq!(claim.state.revision, 1);
 
+    cleanup(&mut connection, &state_prefix, &execution_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
+async fn claim_trigger_script_allows_parallel_occurrences() {
+    let (state_prefix, execution_prefix, store, mut connection) =
+        new_store("coord-parallel-claim").await;
+    let job_id = unique_id("coord-parallel-claim-job");
+    let mut state = fixture_state(&job_id);
+    let first = Utc::now();
+    let second = first + chrono::TimeDelta::milliseconds(10);
+
+    let runtime = load_runtime(&store, &job_id, state.clone()).await;
+    let first_claim = claim_occurrence(
+        &store,
+        &job_id,
+        runtime.revision,
+        &state,
+        first,
+        1,
+        lease_config(),
+    )
+    .await;
+
+    state.trigger_count = 2;
+    let second_claim = claim_occurrence(
+        &store,
+        &job_id,
+        first_claim.state.revision,
+        &state,
+        second,
+        2,
+        lease_config(),
+    )
+    .await;
+
+    assert_ne!(first_claim.lease.lease_key, second_claim.lease.lease_key);
+    cleanup(&mut connection, &state_prefix, &execution_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
+async fn claim_trigger_script_resource_scope_blocks_other_claims() {
+    let (state_prefix, execution_prefix, store, mut connection) =
+        new_store("coord-resource-claim").await;
+    let job_id = unique_id("coord-resource-claim-job");
+    let mut state = fixture_state(&job_id);
+    let first = Utc::now();
+    let second = first + chrono::TimeDelta::milliseconds(10);
+
+    let runtime = load_runtime(&store, &job_id, state.clone()).await;
+    let first_claim = claim_resource(
+        &store,
+        &job_id,
+        runtime.revision,
+        &state,
+        first,
+        1,
+        lease_config(),
+    )
+    .await;
+
+    state.trigger_count = 2;
+    let blocked = store
+        .claim_trigger(
+            &job_id,
+            "resource",
+            first_claim.state.revision,
+            CoordinatedPendingTrigger {
+                scheduled_at: second,
+                catch_up: false,
+                trigger_count: 2,
+            },
+            &state,
+            lease_config(),
+            ExecutionGuardScope::Occurrence,
+        )
+        .await
+        .expect("occurrence claim failed");
+
+    assert!(blocked.is_none());
     cleanup(&mut connection, &state_prefix, &execution_prefix).await;
 }
 
@@ -137,22 +308,17 @@ async fn reclaim_inflight_script_reclaims_expired_occurrence_from_valkey() {
         renew_interval: Duration::from_millis(5),
     };
 
-    let runtime = store
-        .load_or_initialize(&job_id, initial.clone())
-        .await
-        .expect("load_or_initialize failed");
-    let claim = store
-        .claim_trigger(
-            &job_id,
-            "resource",
-            runtime.revision,
-            trigger.clone(),
-            &initial,
-            config,
-        )
-        .await
-        .expect("claim_trigger failed")
-        .expect("expected claim");
+    let runtime = load_runtime(&store, &job_id, initial.clone()).await;
+    let claim = claim_occurrence(
+        &store,
+        &job_id,
+        runtime.revision,
+        &initial,
+        trigger.scheduled_at,
+        trigger.trigger_count,
+        config,
+    )
+    .await;
     assert!(!claim.replayed);
 
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -182,22 +348,17 @@ async fn renew_lease_script_extends_live_occurrence_lease() {
     };
     let config = lease_config();
 
-    let runtime = store
-        .load_or_initialize(&job_id, initial.clone())
-        .await
-        .expect("load_or_initialize failed");
-    let claim = store
-        .claim_trigger(
-            &job_id,
-            "resource",
-            runtime.revision,
-            trigger,
-            &initial,
-            config,
-        )
-        .await
-        .expect("claim_trigger failed")
-        .expect("expected claim");
+    let runtime = load_runtime(&store, &job_id, initial.clone()).await;
+    let claim = claim_occurrence(
+        &store,
+        &job_id,
+        runtime.revision,
+        &initial,
+        trigger.scheduled_at,
+        trigger.trigger_count,
+        config,
+    )
+    .await;
 
     let renewed = store
         .renew(&claim.lease, config)
@@ -211,7 +372,7 @@ async fn renew_lease_script_extends_live_occurrence_lease() {
 
 #[tokio::test]
 #[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
-async fn complete_script_clears_inflight_and_commits_state() {
+async fn complete_script_applies_completion_patch_and_clears_inflight() {
     let (state_prefix, execution_prefix, store, mut connection) = new_store("coord-complete").await;
     let job_id = unique_id("coord-complete-job");
     let initial = fixture_state(&job_id);
@@ -222,29 +383,28 @@ async fn complete_script_clears_inflight_and_commits_state() {
     };
     let config = lease_config();
 
-    let runtime = store
-        .load_or_initialize(&job_id, initial.clone())
-        .await
-        .expect("load_or_initialize failed");
-    let claim = store
-        .claim_trigger(
-            &job_id,
-            "resource",
-            runtime.revision,
-            trigger,
-            &initial,
-            config,
-        )
-        .await
-        .expect("claim_trigger failed")
-        .expect("expected claim");
-    let mut final_state = initial.clone();
-    final_state.last_error = Some("completed".to_string());
-
-    let completed = store
-        .complete(&job_id, claim.state.revision, &claim.lease, &final_state)
-        .await
-        .expect("complete failed");
+    let runtime = load_runtime(&store, &job_id, initial.clone()).await;
+    let claim = claim_occurrence(
+        &store,
+        &job_id,
+        runtime.revision,
+        &initial,
+        trigger.scheduled_at,
+        trigger.trigger_count,
+        config,
+    )
+    .await;
+    let completed = complete_claim(
+        &store,
+        &job_id,
+        &claim,
+        CoordinatedCompletion {
+            last_run_at: Utc::now(),
+            last_success_at: None,
+            last_error: Some("completed".to_string()),
+        },
+    )
+    .await;
 
     assert!(completed);
 
@@ -252,8 +412,58 @@ async fn complete_script_clears_inflight_and_commits_state() {
         .load_or_initialize(&job_id, JobState::new(&job_id, None))
         .await
         .expect("reload failed");
-    assert_eq!(loaded.state, final_state);
+    assert_eq!(loaded.state.last_error, Some("completed".to_string()));
     assert_eq!(loaded.revision, 2);
+
+    cleanup(&mut connection, &state_prefix, &execution_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires SCHEDULER_VALKEY_URL pointing to a reachable Valkey server"]
+async fn complete_script_removes_only_matching_inflight() {
+    let (state_prefix, execution_prefix, store, mut connection) =
+        new_store("coord-complete-one").await;
+    let job_id = unique_id("coord-complete-one-job");
+    let mut state = fixture_state(&job_id);
+    let first = Utc::now();
+    let second = first + chrono::TimeDelta::milliseconds(10);
+    let config = lease_config();
+
+    let runtime = load_runtime(&store, &job_id, state.clone()).await;
+    let first_claim =
+        claim_occurrence(&store, &job_id, runtime.revision, &state, first, 1, config).await;
+    state.trigger_count = 2;
+    let second_claim = claim_occurrence(
+        &store,
+        &job_id,
+        first_claim.state.revision,
+        &state,
+        second,
+        2,
+        config,
+    )
+    .await;
+
+    assert!(
+        complete_claim(
+            &store,
+            &job_id,
+            &first_claim,
+            CoordinatedCompletion {
+                last_run_at: Utc::now(),
+                last_success_at: Some(Utc::now()),
+                last_error: None,
+            },
+        )
+        .await
+    );
+    assert_eq!(
+        store
+            .renew(&second_claim.lease, config)
+            .await
+            .expect("renew second failed"),
+        ExecutionGuardRenewal::Renewed
+    );
 
     cleanup(&mut connection, &state_prefix, &execution_prefix).await;
 }

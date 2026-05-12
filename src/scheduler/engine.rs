@@ -314,15 +314,6 @@ where
             crate::Schedule::Cron(_) => {}
         }
 
-        if matches!(self.backend, SchedulerBackend::Coordinated { .. })
-            && matches!(job.overlap_policy, crate::OverlapPolicy::AllowParallel)
-        {
-            return Err(SchedulerError::invalid_job_with_kind(
-                crate::InvalidJobKind::Other,
-                "coordinated scheduler does not support OverlapPolicy::AllowParallel",
-            ));
-        }
-
         Ok(job)
     }
 

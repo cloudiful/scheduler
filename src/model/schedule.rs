@@ -130,6 +130,13 @@ pub enum OverlapPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeWindowAlignment {
+    #[default]
+    Disabled,
+    AlignToNextWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalStatePolicy {
     #[default]
     Retain,

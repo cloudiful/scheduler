@@ -1,5 +1,5 @@
 use crate::error::{ExecutionGuardErrorKind, StoreErrorKind};
-use crate::execution_guard::{ExecutionGuardRenewal, ExecutionLease};
+use crate::execution_guard::{ExecutionGuardRenewal, ExecutionGuardScope, ExecutionLease};
 use crate::model::JobState;
 use chrono::{DateTime, Utc};
 use std::convert::Infallible;
@@ -50,6 +50,13 @@ pub struct CoordinatedClaim {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedCompletion {
+    pub last_run_at: DateTime<Utc>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
 pub trait CoordinatedStateStore {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -81,6 +88,7 @@ pub trait CoordinatedStateStore {
         trigger: CoordinatedPendingTrigger,
         next_state: &JobState,
         lease_config: CoordinatedLeaseConfig,
+        scope: ExecutionGuardScope,
     ) -> impl Future<Output = Result<Option<CoordinatedClaim>, Self::Error>> + Send;
 
     fn renew(
@@ -92,9 +100,8 @@ pub trait CoordinatedStateStore {
     fn complete(
         &self,
         job_id: &str,
-        revision: u64,
         lease: &ExecutionLease,
-        state: &JobState,
+        completion: CoordinatedCompletion,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
     fn delete(&self, job_id: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -162,6 +169,7 @@ impl CoordinatedStateStore for NoopCoordinatedStateStore {
         _trigger: CoordinatedPendingTrigger,
         _next_state: &JobState,
         _lease_config: CoordinatedLeaseConfig,
+        _scope: ExecutionGuardScope,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         Ok(None)
     }
@@ -177,9 +185,8 @@ impl CoordinatedStateStore for NoopCoordinatedStateStore {
     async fn complete(
         &self,
         _job_id: &str,
-        _revision: u64,
         _lease: &ExecutionLease,
-        _state: &JobState,
+        _completion: CoordinatedCompletion,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -241,6 +248,7 @@ where
         trigger: CoordinatedPendingTrigger,
         next_state: &JobState,
         lease_config: CoordinatedLeaseConfig,
+        scope: ExecutionGuardScope,
     ) -> Result<Option<CoordinatedClaim>, Self::Error> {
         self.as_ref()
             .claim_trigger(
@@ -250,6 +258,7 @@ where
                 trigger,
                 next_state,
                 lease_config,
+                scope,
             )
             .await
     }
@@ -265,11 +274,10 @@ where
     async fn complete(
         &self,
         job_id: &str,
-        revision: u64,
         lease: &ExecutionLease,
-        state: &JobState,
+        completion: CoordinatedCompletion,
     ) -> Result<bool, Self::Error> {
-        self.as_ref().complete(job_id, revision, lease, state).await
+        self.as_ref().complete(job_id, lease, completion).await
     }
 
     async fn delete(&self, job_id: &str) -> Result<(), Self::Error> {
