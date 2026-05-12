@@ -1,5 +1,7 @@
 use crate::error::SchedulerError;
-use crate::model::{Job, JobState, Schedule, StaggeredIntervalSchedule, utc_time};
+use crate::model::{
+    GroupedIntervalSchedule, Job, JobState, Schedule, StaggeredIntervalSchedule, utc_time,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 use chrono_tz::Tz;
 use std::time::Duration;
@@ -36,6 +38,9 @@ pub(crate) fn initial_next_run_at<D>(
             .map(Some),
         Schedule::StaggeredInterval(staggered) => {
             staggered_initial_next_run_at(Utc::now(), staggered, &job.job_id).map(Some)
+        }
+        Schedule::GroupedInterval(grouped) => {
+            grouped_initial_next_run_at(Utc::now(), grouped).map(Some)
         }
         Schedule::AtTimes(times) => Ok(times.first().copied().map(utc_time)),
         Schedule::Cron(schedule) => Ok(schedule.next_after(Utc::now(), timezone)),
@@ -147,6 +152,11 @@ where
                 .ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
             Ok(scheduled_at.checked_add_signed(delta))
         }
+        Schedule::GroupedInterval(grouped) => {
+            let delta = duration_to_delta(grouped.every)
+                .ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
+            Ok(scheduled_at.checked_add_signed(delta))
+        }
         Schedule::AtTimes(times) => Ok(times.get(trigger_count as usize).copied().map(utc_time)),
         Schedule::Cron(schedule) => Ok(schedule.next_after(scheduled_at, timezone)),
     }
@@ -193,21 +203,24 @@ fn stable_seed_hash(seed: &str) -> u64 {
     hash
 }
 
-fn staggered_initial_next_run_at(
-    now: DateTime<Utc>,
-    staggered: &StaggeredIntervalSchedule,
-    seed: &str,
-) -> Result<DateTime<Utc>, SchedulerError> {
-    let interval_nanos = duration_to_nanos(staggered.every)
-        .ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
+fn interval_nanos(every: Duration) -> Result<u128, SchedulerError> {
+    let interval_nanos =
+        duration_to_nanos(every).ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
     if interval_nanos == 0 {
         return Err(SchedulerError::invalid_zero_interval());
     }
+    Ok(interval_nanos)
+}
 
+fn aligned_initial_next_run_at(
+    now: DateTime<Utc>,
+    interval_nanos: u128,
+    phase_nanos: u128,
+) -> Result<DateTime<Utc>, SchedulerError> {
     let interval_nanos = i128::try_from(interval_nanos)
         .map_err(|_| SchedulerError::invalid_interval_out_of_range())?;
-    let phase_nanos = i128::from(stable_seed_hash(staggered.seed.as_deref().unwrap_or(seed)))
-        .rem_euclid(interval_nanos);
+    let phase_nanos =
+        i128::try_from(phase_nanos).map_err(|_| SchedulerError::invalid_interval_out_of_range())?;
     let now_nanos = utc_to_nanos(now);
     let cycle_start = now_nanos.div_euclid(interval_nanos) * interval_nanos;
     let mut candidate = cycle_start + phase_nanos;
@@ -216,6 +229,59 @@ fn staggered_initial_next_run_at(
     }
 
     nanos_to_utc(candidate).ok_or_else(SchedulerError::invalid_interval_out_of_range)
+}
+
+fn staggered_initial_next_run_at(
+    now: DateTime<Utc>,
+    staggered: &StaggeredIntervalSchedule,
+    seed: &str,
+) -> Result<DateTime<Utc>, SchedulerError> {
+    let interval_nanos = interval_nanos(staggered.every)?;
+    let phase_nanos =
+        u128::from(stable_seed_hash(staggered.seed.as_deref().unwrap_or(seed))) % interval_nanos;
+
+    aligned_initial_next_run_at(now, interval_nanos, phase_nanos)
+}
+
+fn grouped_initial_next_run_at(
+    now: DateTime<Utc>,
+    grouped: &GroupedIntervalSchedule,
+) -> Result<DateTime<Utc>, SchedulerError> {
+    validate_grouped_interval(grouped)?;
+    let interval_nanos = interval_nanos(grouped.every)?;
+    let base_phase_nanos = interval_nanos
+        .checked_mul(u128::from(grouped.member_index))
+        .ok_or_else(SchedulerError::invalid_interval_out_of_range)?
+        / u128::from(grouped.group_size);
+    let group_offset_nanos = grouped
+        .group_seed
+        .as_deref()
+        .map(|seed| u128::from(stable_seed_hash(seed)) % interval_nanos)
+        .unwrap_or(0);
+    let phase_nanos = base_phase_nanos
+        .checked_add(group_offset_nanos)
+        .ok_or_else(SchedulerError::invalid_interval_out_of_range)?
+        % interval_nanos;
+
+    aligned_initial_next_run_at(now, interval_nanos, phase_nanos)
+}
+
+pub(crate) fn validate_grouped_interval(
+    grouped: &GroupedIntervalSchedule,
+) -> Result<(), SchedulerError> {
+    if grouped.group_size == 0 {
+        return Err(SchedulerError::invalid_job_with_kind(
+            crate::InvalidJobKind::Other,
+            "grouped interval group_size must be greater than zero",
+        ));
+    }
+    if grouped.member_index >= grouped.group_size {
+        return Err(SchedulerError::invalid_job_with_kind(
+            crate::InvalidJobKind::Other,
+            "grouped interval member_index must be less than group_size",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -266,9 +332,12 @@ where
 mod tests {
     use super::{
         advance_state_for, collect_due_times, compute_next_after, nanos_to_utc, stable_seed_hash,
-        staggered_initial_next_run_at, utc_to_nanos,
+        staggered_initial_next_run_at, utc_to_nanos, validate_grouped_interval,
     };
-    use crate::{Job, JobState, MissedRunPolicy, Schedule, StaggeredIntervalSchedule, Task};
+    use crate::{
+        GroupedIntervalSchedule, InvalidJobKind, Job, JobState, MissedRunPolicy, Schedule,
+        StaggeredIntervalSchedule, Task,
+    };
     use chrono::{TimeDelta, TimeZone, Utc};
     use chrono_tz::Asia::Shanghai;
     use std::time::Duration;
@@ -351,5 +420,65 @@ mod tests {
             state.next_run_at,
             Some((first + TimeDelta::seconds(5)).with_timezone(&Utc))
         );
+    }
+
+    #[test]
+    fn grouped_initial_next_run_is_evenly_spaced() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
+        let interval = Duration::from_secs(120 * 60);
+        let member0 = GroupedIntervalSchedule::new(interval, 3, 0);
+        let member1 = GroupedIntervalSchedule::new(interval, 3, 1);
+        let member2 = GroupedIntervalSchedule::new(interval, 3, 2);
+
+        let next0 = super::grouped_initial_next_run_at(now, &member0).unwrap();
+        let next1 = super::grouped_initial_next_run_at(now, &member1).unwrap();
+        let next2 = super::grouped_initial_next_run_at(now, &member2).unwrap();
+
+        assert_eq!(next0, now);
+        assert_eq!(next1, now + TimeDelta::minutes(40));
+        assert_eq!(next2, now + TimeDelta::minutes(80));
+    }
+
+    #[test]
+    fn grouped_initial_next_run_uses_group_seed_as_a_shared_rotation() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
+        let interval = Duration::from_secs(120 * 60);
+        let a0 = GroupedIntervalSchedule::new(interval, 3, 0).with_group_seed("site-a");
+        let a1 = GroupedIntervalSchedule::new(interval, 3, 1).with_group_seed("site-a");
+        let b0 = GroupedIntervalSchedule::new(interval, 3, 0).with_group_seed("site-b");
+
+        let next_a0 = super::grouped_initial_next_run_at(now, &a0).unwrap();
+        let next_a1 = super::grouped_initial_next_run_at(now, &a1).unwrap();
+        let next_b0 = super::grouped_initial_next_run_at(now, &b0).unwrap();
+
+        assert_eq!(
+            (next_a1 - next_a0).num_seconds().rem_euclid(120 * 60),
+            40 * 60
+        );
+        assert_eq!(
+            next_a0,
+            super::grouped_initial_next_run_at(now, &a0).unwrap()
+        );
+        assert_ne!(next_a0, next_b0);
+    }
+
+    #[test]
+    fn grouped_interval_validation_rejects_invalid_parameters() {
+        let zero_group = GroupedIntervalSchedule::new(Duration::from_secs(60), 0, 0);
+        let out_of_range = GroupedIntervalSchedule::new(Duration::from_secs(60), 3, 3);
+
+        let zero_group_error = validate_grouped_interval(&zero_group).unwrap_err();
+        let out_of_range_error = validate_grouped_interval(&out_of_range).unwrap_err();
+
+        assert!(matches!(
+            zero_group_error,
+            crate::SchedulerError::InvalidJob(ref invalid)
+                if invalid.kind() == InvalidJobKind::Other
+        ));
+        assert!(matches!(
+            out_of_range_error,
+            crate::SchedulerError::InvalidJob(ref invalid)
+                if invalid.kind() == InvalidJobKind::Other
+        ));
     }
 }

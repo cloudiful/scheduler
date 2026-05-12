@@ -1,6 +1,6 @@
 [package]
 name = "cloudiful-scheduler"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "Apache-2.0"
 description = "Single-job async scheduling library for background work with optional Valkey-backed state."

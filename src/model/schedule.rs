@@ -21,6 +21,31 @@ impl StaggeredIntervalSchedule {
     }
 }
 
+/// Interval schedule that spreads members evenly across the interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedIntervalSchedule {
+    pub every: Duration,
+    pub group_size: u32,
+    pub member_index: u32,
+    pub group_seed: Option<String>,
+}
+
+impl GroupedIntervalSchedule {
+    pub fn new(every: Duration, group_size: u32, member_index: u32) -> Self {
+        Self {
+            every,
+            group_size,
+            member_index,
+            group_seed: None,
+        }
+    }
+
+    pub fn with_group_seed(mut self, group_seed: impl Into<String>) -> Self {
+        self.group_seed = Some(group_seed.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Schedule {
     /// Trigger repeatedly after the given interval.
@@ -30,6 +55,13 @@ pub enum Schedule {
     /// The first run is aligned to a deterministic phase derived from the
     /// seed. If no seed is provided, the job id is used.
     StaggeredInterval(StaggeredIntervalSchedule),
+    /// Trigger repeatedly after the given interval with evenly spaced group
+    /// members.
+    ///
+    /// The first run is aligned to a stable slot determined by the member
+    /// index. An optional group seed can rotate the entire group without
+    /// changing the spacing between members.
+    GroupedInterval(GroupedIntervalSchedule),
     /// Trigger at the listed wall-clock times.
     ///
     /// The list is sorted before execution starts. An empty list is treated as
@@ -100,6 +132,29 @@ impl Schedule {
     /// Create a staggered interval schedule with an explicit phase seed.
     pub fn staggered_interval_with_seed(every: Duration, seed: impl Into<String>) -> Self {
         Self::StaggeredInterval(StaggeredIntervalSchedule::new(every).with_seed(seed))
+    }
+
+    /// Create a grouped interval schedule with evenly spaced members.
+    pub fn grouped_interval(every: Duration, group_size: u32, member_index: u32) -> Self {
+        Self::GroupedInterval(GroupedIntervalSchedule::new(
+            every,
+            group_size,
+            member_index,
+        ))
+    }
+
+    /// Create a grouped interval schedule and rotate the whole group with an
+    /// explicit seed.
+    pub fn grouped_interval_with_seed(
+        every: Duration,
+        group_size: u32,
+        member_index: u32,
+        group_seed: impl Into<String>,
+    ) -> Self {
+        Self::GroupedInterval(
+            GroupedIntervalSchedule::new(every, group_size, member_index)
+                .with_group_seed(group_seed),
+        )
     }
 }
 

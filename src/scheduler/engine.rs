@@ -163,7 +163,9 @@ where
         }
         if !matches!(
             job.schedule,
-            crate::Schedule::Interval(_) | crate::Schedule::StaggeredInterval(_)
+            crate::Schedule::Interval(_)
+                | crate::Schedule::StaggeredInterval(_)
+                | crate::Schedule::GroupedInterval(_)
         ) {
             return false;
         }
@@ -267,6 +269,12 @@ where
                 if staggered.every.is_zero() {
                     return Err(SchedulerError::invalid_zero_interval());
                 }
+            }
+            crate::Schedule::GroupedInterval(grouped) => {
+                if grouped.every.is_zero() {
+                    return Err(SchedulerError::invalid_zero_interval());
+                }
+                crate::scheduler::trigger_math::validate_grouped_interval(grouped)?;
             }
             crate::Schedule::AtTimes(times) => times.sort_unstable(),
             crate::Schedule::Cron(_) => {}

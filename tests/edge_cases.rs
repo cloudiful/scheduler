@@ -222,3 +222,51 @@ async fn zero_staggered_interval_has_specific_error_kind() {
             if invalid.kind() == InvalidJobKind::ZeroInterval
     ));
 }
+
+#[tokio::test]
+async fn invalid_grouped_interval_parameters_have_specific_error_kind() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+
+    let zero_interval_error = scheduler
+        .run(Job::without_deps(
+            "zero-grouped-interval",
+            Schedule::grouped_interval(Duration::ZERO, 1, 0),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    let zero_group_error = scheduler
+        .run(Job::without_deps(
+            "zero-group-size",
+            Schedule::grouped_interval(Duration::from_millis(20), 0, 0),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    let out_of_range_error = scheduler
+        .run(Job::without_deps(
+            "out-of-range-group-member",
+            Schedule::grouped_interval(Duration::from_millis(20), 3, 3),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        zero_interval_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::ZeroInterval
+    ));
+    assert!(matches!(
+        zero_group_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+    assert!(matches!(
+        out_of_range_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+}

@@ -11,6 +11,8 @@
 //! - [`Schedule::Interval`] schedules the first run at `now + interval`.
 //! - [`Schedule::StaggeredInterval`] spreads interval jobs by a stable phase
 //!   derived from the job id or an explicit seed.
+//! - [`Schedule::GroupedInterval`] spreads known group members evenly across
+//!   each interval.
 //! - [`Schedule::Cron`] evaluates a standard 5-field cron expression in
 //!   [`SchedulerConfig::timezone`].
 //! - [`JobTimeWindow`] can restrict execution by local weekday and time
@@ -83,10 +85,10 @@ pub use execution_guard::{
 };
 pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
-    CronSchedule, Job, JobFuture, JobResult, JobState, JobTimeWindow, MissedRunPolicy,
-    OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus, Schedule, SchedulerConfig,
-    SchedulerReport, StaggeredIntervalSchedule, Task, TaskContext, TerminalStatePolicy,
-    TimeWindowSegment,
+    CronSchedule, GroupedIntervalSchedule, Job, JobFuture, JobResult, JobState, JobTimeWindow,
+    MissedRunPolicy, OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus, Schedule,
+    SchedulerConfig, SchedulerReport, StaggeredIntervalSchedule, Task, TaskContext,
+    TerminalStatePolicy, TimeWindowSegment,
 };
 pub use observer::{
     LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,
