@@ -53,7 +53,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 If multiple scheduler instances must share pause state and reclaim expired
 inflight occurrences, use `ValkeyCoordinatedStateStore` together with
-`Scheduler::with_coordinated_state_store(...)`.
+`Scheduler::with_coordinated_state_store(...)`. During connection-class Valkey
+failures, coordinated scheduling fails closed: it does not claim new triggers
+or advance shared state until Valkey accepts commands again, then reloads
+shared state and resumes normal claim/reclaim flow.
 
 Enable Valkey-backed execution leases:
 
@@ -353,7 +356,8 @@ This persists `JobState` in a single key per `job_id`. It improves restart recov
 
 The current Rust client still uses the `redis://` URI scheme for RESP servers, including Valkey.
 By default, keys are written under the `scheduler:valkey:job-state:` prefix. Loads also check the legacy `scheduler:job-state:` prefix so existing persisted state can still be resumed.
-For connection-class failures, `ValkeyStateStore::resilient(...)` downgrades to an in-memory mirror. Codec/data errors still fail the run.
+Valkey commands use a small retry/backoff window through `ValkeyRecoveryConfig`.
+For connection-class failures, `ValkeyStateStore::resilient(...)` downgrades to an in-memory mirror, records dirty state, and writes it back once Valkey accepts commands again. Codec/data errors still fail the run.
 
 ```rust
 use std::time::Duration;
@@ -380,6 +384,7 @@ async fn main() {
 ## Example: Valkey-backed execution guard
 
 This keeps `StateStore` and distributed mutual exclusion separate. The guard lease key is based on `job_id + scheduled_at`, so `OverlapPolicy::AllowParallel` can still run different occurrences concurrently.
+When Valkey is temporarily unavailable, the guard fails closed: new runs are treated as contended after retry/backoff instead of using a local lock. If renewal fails for an existing lease, the scheduler reports the lease as lost and stops future triggers for that run.
 
 ```rust
 use std::time::Duration;

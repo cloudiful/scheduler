@@ -25,8 +25,9 @@ impl ValkeyStateStore {
         Self::with_prefix(url, DEFAULT_KEY_PREFIX).await
     }
 
-    /// Creates a Valkey-backed store that permanently falls back to an
-    /// in-process mirror after connection-class failures.
+    /// Creates a Valkey-backed store that falls back to an in-process mirror
+    /// after connection-class failures and writes dirty state back once Valkey
+    /// accepts commands again.
     pub async fn resilient(
         url: impl AsRef<str>,
     ) -> Result<ResilientStateStore<Self>, ValkeyStoreError> {
