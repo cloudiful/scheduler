@@ -2,12 +2,16 @@ use crate::error::{ExecutionGuardError, ExecutionGuardErrorKind};
 use crate::valkey_execution_support::{
     lease_key, next_token, now_millis, occurrence_index_key, resource_lock_key,
 };
+use crate::valkey_runtime::{
+    ValkeyCommandOutcome, ValkeyRecoveryConfig, ValkeyRuntime, ValkeyRuntimeEvent,
+    is_connection_issue,
+};
 use crate::valkey_scripts;
 use crate::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionGuardScope,
-    ExecutionLease, ExecutionSlot,
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardEvent, ExecutionGuardRenewal,
+    ExecutionGuardScope, ExecutionLease, ExecutionSlot,
 };
-use redis::{Client, ErrorKind, ServerErrorKind, aio::ConnectionManager};
+use redis::Client;
 use std::fmt::{self, Display, Formatter};
 use std::num::TryFromIntError;
 use std::sync::atomic::AtomicU64;
@@ -25,7 +29,7 @@ pub struct ValkeyLeaseConfig {
 
 #[derive(Debug, Clone)]
 pub struct ValkeyExecutionGuard {
-    connection: ConnectionManager,
+    runtime: ValkeyRuntime,
     key_prefix: String,
     lease_config: ValkeyLeaseConfig,
 }
@@ -43,18 +47,49 @@ impl ValkeyExecutionGuard {
         key_prefix: impl Into<String>,
         lease_config: ValkeyLeaseConfig,
     ) -> Result<Self, ExecutionGuardError> {
+        Self::with_prefix_and_recovery_config(
+            url,
+            key_prefix,
+            lease_config,
+            ValkeyRecoveryConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_recovery_config(
+        url: impl AsRef<str>,
+        lease_config: ValkeyLeaseConfig,
+        recovery_config: ValkeyRecoveryConfig,
+    ) -> Result<Self, ExecutionGuardError> {
+        Self::with_prefix_and_recovery_config(
+            url,
+            DEFAULT_KEY_PREFIX,
+            lease_config,
+            recovery_config,
+        )
+        .await
+    }
+
+    pub async fn with_prefix_and_recovery_config(
+        url: impl AsRef<str>,
+        key_prefix: impl Into<String>,
+        lease_config: ValkeyLeaseConfig,
+        recovery_config: ValkeyRecoveryConfig,
+    ) -> Result<Self, ExecutionGuardError> {
         lease_config.validate()?;
         let client = Client::open(url.as_ref()).map_err(|error| {
             let kind = classify_redis_error(&error);
             ExecutionGuardError::new(error, kind)
         })?;
-        let connection = client.get_connection_manager().await.map_err(|error| {
-            let kind = classify_redis_error(&error);
-            ExecutionGuardError::new(error, kind)
-        })?;
+        let runtime = ValkeyRuntime::from_client(client, recovery_config)
+            .await
+            .map_err(|error| {
+                let kind = classify_redis_error(&error);
+                ExecutionGuardError::new(error, kind)
+            })?;
 
         Ok(Self {
-            connection,
+            runtime,
             key_prefix: key_prefix.into(),
             lease_config,
         })
@@ -87,39 +122,54 @@ impl ExecutionGuard for ValkeyExecutionGuard {
         let ttl_millis = self.ttl_millis()?;
         let now_millis = now_millis();
         let expires_at_millis = now_millis.saturating_add(ttl_millis);
-        let mut connection = self.connection.clone();
-        let acquired = match slot.scope {
-            ExecutionGuardScope::Occurrence => {
-                let resource_lock_key = self.resource_lock_key(&slot.resource_id);
-                let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
-                let acquired: i32 =
-                    valkey_scripts::script(valkey_scripts::guard::ACQUIRE_OCCURRENCE)
-                        .key(resource_lock_key)
-                        .key(&lease_key)
-                        .key(occurrence_index_key)
-                        .arg(now_millis)
-                        .arg(&token)
-                        .arg(ttl_millis)
-                        .arg(expires_at_millis)
-                        .invoke_async(&mut connection)
-                        .await
-                        .map_err(ValkeyExecutionGuardError::Redis)?;
-                acquired == 1
-            }
-            ExecutionGuardScope::Resource => {
-                let resource_lock_key = self.resource_lock_key(&slot.resource_id);
-                let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
-                let acquired: i32 = valkey_scripts::script(valkey_scripts::guard::ACQUIRE_RESOURCE)
-                    .key(&resource_lock_key)
-                    .key(occurrence_index_key)
-                    .arg(now_millis)
-                    .arg(&token)
-                    .arg(ttl_millis)
-                    .invoke_async(&mut connection)
-                    .await
-                    .map_err(ValkeyExecutionGuardError::Redis)?;
-                acquired == 1
-            }
+        let resource_lock_key = self.resource_lock_key(&slot.resource_id);
+        let occurrence_index_key = self.occurrence_index_key(&slot.resource_id);
+        let scope = slot.scope;
+        let command_lease_key = lease_key.clone();
+        let command_token = token.clone();
+        let result: ValkeyCommandOutcome<bool> = self
+            .runtime
+            .execute(move |mut connection| {
+                let lease_key = command_lease_key.clone();
+                let token = command_token.clone();
+                let resource_lock_key = resource_lock_key.clone();
+                let occurrence_index_key = occurrence_index_key.clone();
+                async move {
+                    match scope {
+                        ExecutionGuardScope::Occurrence => {
+                            let acquired: i32 =
+                                valkey_scripts::script(valkey_scripts::guard::ACQUIRE_OCCURRENCE)
+                                    .key(resource_lock_key)
+                                    .key(&lease_key)
+                                    .key(occurrence_index_key)
+                                    .arg(now_millis)
+                                    .arg(&token)
+                                    .arg(ttl_millis)
+                                    .arg(expires_at_millis)
+                                    .invoke_async(&mut connection)
+                                    .await?;
+                            Ok(acquired == 1)
+                        }
+                        ExecutionGuardScope::Resource => {
+                            let acquired: i32 =
+                                valkey_scripts::script(valkey_scripts::guard::ACQUIRE_RESOURCE)
+                                    .key(&resource_lock_key)
+                                    .key(occurrence_index_key)
+                                    .arg(now_millis)
+                                    .arg(&token)
+                                    .arg(ttl_millis)
+                                    .invoke_async(&mut connection)
+                                    .await?;
+                            Ok(acquired == 1)
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?;
+
+        let ValkeyCommandOutcome::Available(acquired) = result else {
+            return Ok(ExecutionGuardAcquire::Contended);
         };
 
         Ok(if acquired {
@@ -139,28 +189,41 @@ impl ExecutionGuard for ValkeyExecutionGuard {
     async fn renew(&self, lease: &ExecutionLease) -> Result<ExecutionGuardRenewal, Self::Error> {
         let ttl_millis = self.ttl_millis()?;
         let expires_at_millis = now_millis().saturating_add(ttl_millis);
-        let mut connection = self.connection.clone();
-        let renewed: i32 = match lease.scope {
-            ExecutionGuardScope::Occurrence => {
-                { valkey_scripts::script(valkey_scripts::guard::RENEW_OCCURRENCE) }
-                    .key(&lease.lease_key)
-                    .key(self.occurrence_index_key(&lease.resource_id))
-                    .arg(&lease.token)
-                    .arg(ttl_millis)
-                    .arg(expires_at_millis)
-                    .invoke_async(&mut connection)
-                    .await
-                    .map_err(ValkeyExecutionGuardError::Redis)?
-            }
-            ExecutionGuardScope::Resource => {
-                { valkey_scripts::script(valkey_scripts::guard::RENEW_RESOURCE) }
-                    .key(&lease.lease_key)
-                    .arg(&lease.token)
-                    .arg(ttl_millis)
-                    .invoke_async(&mut connection)
-                    .await
-                    .map_err(ValkeyExecutionGuardError::Redis)?
-            }
+        let occurrence_index_key = self.occurrence_index_key(&lease.resource_id);
+        let lease = lease.clone();
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let lease = lease.clone();
+                let occurrence_index_key = occurrence_index_key.clone();
+                async move {
+                    match lease.scope {
+                        ExecutionGuardScope::Occurrence => {
+                            valkey_scripts::script(valkey_scripts::guard::RENEW_OCCURRENCE)
+                                .key(&lease.lease_key)
+                                .key(occurrence_index_key)
+                                .arg(&lease.token)
+                                .arg(ttl_millis)
+                                .arg(expires_at_millis)
+                                .invoke_async(&mut connection)
+                                .await
+                        }
+                        ExecutionGuardScope::Resource => {
+                            valkey_scripts::script(valkey_scripts::guard::RENEW_RESOURCE)
+                                .key(&lease.lease_key)
+                                .arg(&lease.token)
+                                .arg(ttl_millis)
+                                .invoke_async(&mut connection)
+                                .await
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?;
+
+        let ValkeyCommandOutcome::Available(renewed) = result else {
+            return Ok(ExecutionGuardRenewal::Lost);
         };
 
         Ok(if renewed == 1 {
@@ -171,28 +234,50 @@ impl ExecutionGuard for ValkeyExecutionGuard {
     }
 
     async fn release(&self, lease: &ExecutionLease) -> Result<(), Self::Error> {
-        let mut connection = self.connection.clone();
-        let _: i32 = match lease.scope {
-            ExecutionGuardScope::Occurrence => {
-                { valkey_scripts::script(valkey_scripts::guard::RELEASE_OCCURRENCE) }
-                    .key(&lease.lease_key)
-                    .key(self.occurrence_index_key(&lease.resource_id))
-                    .arg(&lease.token)
-                    .invoke_async(&mut connection)
-                    .await
-                    .map_err(ValkeyExecutionGuardError::Redis)?
-            }
-            ExecutionGuardScope::Resource => {
-                { valkey_scripts::script(valkey_scripts::guard::RELEASE_RESOURCE) }
-                    .key(&lease.lease_key)
-                    .arg(&lease.token)
-                    .invoke_async(&mut connection)
-                    .await
-                    .map_err(ValkeyExecutionGuardError::Redis)?
-            }
-        };
+        let occurrence_index_key = self.occurrence_index_key(&lease.resource_id);
+        let lease = lease.clone();
+        let _: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let lease = lease.clone();
+                let occurrence_index_key = occurrence_index_key.clone();
+                async move {
+                    match lease.scope {
+                        ExecutionGuardScope::Occurrence => {
+                            valkey_scripts::script(valkey_scripts::guard::RELEASE_OCCURRENCE)
+                                .key(&lease.lease_key)
+                                .key(occurrence_index_key)
+                                .arg(&lease.token)
+                                .invoke_async(&mut connection)
+                                .await
+                        }
+                        ExecutionGuardScope::Resource => {
+                            valkey_scripts::script(valkey_scripts::guard::RELEASE_RESOURCE)
+                                .key(&lease.lease_key)
+                                .arg(&lease.token)
+                                .invoke_async(&mut connection)
+                                .await
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(ValkeyExecutionGuardError::Redis)?;
 
         Ok(())
+    }
+
+    async fn drain_events(&self) -> Result<Vec<ExecutionGuardEvent>, Self::Error> {
+        Ok(self
+            .runtime
+            .drain_events()
+            .await
+            .into_iter()
+            .map(|event| match event {
+                ValkeyRuntimeEvent::Degraded { error } => ExecutionGuardEvent::Degraded { error },
+                ValkeyRuntimeEvent::Recovered => ExecutionGuardEvent::Recovered,
+            })
+            .collect())
     }
 
     fn classify_error(error: &Self::Error) -> ExecutionGuardErrorKind
@@ -294,19 +379,7 @@ impl ValkeyLeaseConfig {
 }
 
 fn classify_redis_error(error: &redis::RedisError) -> ExecutionGuardErrorKind {
-    if error.is_connection_dropped()
-        || error.is_connection_refusal()
-        || error.is_timeout()
-        || matches!(
-            error.kind(),
-            ErrorKind::Io
-                | ErrorKind::ClusterConnectionNotFound
-                | ErrorKind::Server(ServerErrorKind::BusyLoading)
-                | ErrorKind::Server(ServerErrorKind::ClusterDown)
-                | ErrorKind::Server(ServerErrorKind::MasterDown)
-                | ErrorKind::Server(ServerErrorKind::TryAgain)
-        )
-    {
+    if is_connection_issue(error) {
         ExecutionGuardErrorKind::Connection
     } else {
         ExecutionGuardErrorKind::Unknown

@@ -9,7 +9,9 @@ use crate::error::SchedulerError;
 use crate::model::{Job, JobState, RunRecord};
 use crate::observer::{PauseScope, SchedulerEvent, StateLoadSource};
 use crate::store::StateStore;
-use crate::{ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardScope, ExecutionSlot};
+use crate::{
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardEvent, ExecutionGuardScope, ExecutionSlot,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -285,6 +287,7 @@ where
         let kind = G::classify_error(&error);
         SchedulerError::execution_guard(error, kind)
     })?;
+    emit_guard_events(scheduler, guard.as_ref(), job, &trigger).await?;
 
     let ExecutionGuardAcquire::Acquired(lease) = acquired else {
         scheduler.emit(SchedulerEvent::ExecutionGuardContended {
@@ -317,4 +320,48 @@ where
         lease,
     );
     Ok(true)
+}
+
+async fn emit_guard_events<S, G, C, D>(
+    scheduler: &Scheduler<S, G, C>,
+    guard: &G,
+    job: &Job<D>,
+    trigger: &PendingTrigger,
+) -> Result<(), SchedulerError>
+where
+    S: StateStore + Send + Sync + 'static,
+    G: ExecutionGuard + Send + Sync + 'static,
+    C: crate::CoordinatedStateStore + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    let events = guard.drain_events().await.map_err(|error| {
+        let kind = G::classify_error(&error);
+        SchedulerError::execution_guard(error, kind)
+    })?;
+    for event in events {
+        match event {
+            ExecutionGuardEvent::Degraded { error } => {
+                scheduler.emit(SchedulerEvent::ExecutionGuardDegraded {
+                    job_id: job.job_id.clone(),
+                    resource_id: job.execution_resource_id.clone(),
+                    scope: job.guard_scope,
+                    scheduled_at: Some(trigger.scheduled_at),
+                    catch_up: trigger.catch_up,
+                    trigger_count: trigger.trigger_count,
+                    error,
+                });
+            }
+            ExecutionGuardEvent::Recovered => {
+                scheduler.emit(SchedulerEvent::ExecutionGuardRecovered {
+                    job_id: job.job_id.clone(),
+                    resource_id: job.execution_resource_id.clone(),
+                    scope: job.guard_scope,
+                    scheduled_at: Some(trigger.scheduled_at),
+                    catch_up: trigger.catch_up,
+                    trigger_count: trigger.trigger_count,
+                });
+            }
+        }
+    }
+    Ok(())
 }

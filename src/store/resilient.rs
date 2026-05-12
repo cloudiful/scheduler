@@ -1,27 +1,23 @@
 use super::{InMemoryStateStore, ResilientStoreError, StateStore, StoreEvent, StoreOperation};
 use crate::error::StoreErrorKind;
 use crate::model::JobState;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
-#[derive(Debug)]
-enum ResilientMode<S> {
-    Primary(S),
-    MemoryOnly,
-}
-
 /// Wraps a primary store with an in-process mirror that takes over after
-/// connection-class failures.
+/// connection-class failures and opportunistically writes dirty state back once
+/// the primary accepts commands again.
 #[derive(Debug)]
 pub struct ResilientStateStore<S>
 where
     S: StateStore,
     S::Error: ResilientStoreError,
 {
-    mode: Mutex<ResilientMode<S>>,
+    primary: S,
     degraded: AtomicBool,
     mirror: InMemoryStateStore,
+    dirty: Mutex<HashMap<String, Option<JobState>>>,
     events: Mutex<VecDeque<StoreEvent>>,
 }
 
@@ -32,18 +28,20 @@ where
 {
     pub fn new(store: S) -> Self {
         Self {
-            mode: Mutex::new(ResilientMode::Primary(store)),
+            primary: store,
             degraded: AtomicBool::new(false),
             mirror: InMemoryStateStore::new(),
+            dirty: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
         }
     }
 
-    pub fn degraded() -> Self {
+    pub fn degraded(store: S) -> Self {
         Self {
-            mode: Mutex::new(ResilientMode::MemoryOnly),
+            primary: store,
             degraded: AtomicBool::new(true),
             mirror: InMemoryStateStore::new(),
+            dirty: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
         }
     }
@@ -51,7 +49,7 @@ where
     pub fn from_result(result: Result<S, S::Error>) -> Result<Self, S::Error> {
         match result {
             Ok(store) => Ok(Self::new(store)),
-            Err(error) if error.is_connection_issue() => Ok(Self::degraded()),
+            Err(error) if error.is_connection_issue() => Err(error),
             Err(error) => Err(error),
         }
     }
@@ -99,91 +97,131 @@ where
             });
         }
     }
+
+    async fn mark_recovering(&self, operation: StoreOperation) {
+        self.events
+            .lock()
+            .await
+            .push_back(StoreEvent::Recovering { operation });
+    }
+
+    async fn mark_recovered(&self, operation: StoreOperation) {
+        let was_degraded = self.degraded.swap(false, Ordering::SeqCst);
+        if was_degraded {
+            self.events
+                .lock()
+                .await
+                .push_back(StoreEvent::Recovered { operation });
+        }
+    }
+
+    async fn mark_recovery_failed(&self, operation: StoreOperation, error: &S::Error) {
+        self.events
+            .lock()
+            .await
+            .push_back(StoreEvent::RecoveryFailed {
+                operation,
+                error: error.to_string(),
+            });
+    }
+
+    async fn record_dirty(&self, job_id: String, state: Option<JobState>) {
+        self.dirty.lock().await.insert(job_id, state);
+    }
+
+    async fn clear_dirty(&self, job_id: &str, operation: StoreOperation) {
+        let mut dirty = self.dirty.lock().await;
+        dirty.remove(job_id);
+        if dirty.is_empty() {
+            drop(dirty);
+            self.mark_recovered(operation).await;
+        }
+    }
+
+    async fn dirty_state(&self, job_id: &str) -> Option<Option<JobState>> {
+        self.dirty.lock().await.get(job_id).cloned()
+    }
 }
 
 impl<S> StateStore for ResilientStateStore<S>
 where
-    S: StateStore + Send,
+    S: StateStore + Send + Sync,
     S::Error: ResilientStoreError,
 {
     type Error = S::Error;
 
     async fn load(&self, job_id: &str) -> Result<Option<JobState>, Self::Error> {
-        let mut mode = self.mode.lock().await;
+        if self.is_degraded() {
+            if let Some(dirty) = self.dirty_state(job_id).await {
+                return Ok(dirty);
+            }
+        }
 
-        match &mut *mode {
-            ResilientMode::Primary(store) => match store.load(job_id).await {
-                Ok(state) => {
-                    drop(mode);
-                    self.sync_mirror(job_id, state.as_ref()).await?;
-                    Ok(state)
+        match self.primary.load(job_id).await {
+            Ok(state) => {
+                self.sync_mirror(job_id, state.as_ref()).await?;
+                if self.is_degraded() {
+                    self.mark_recovered(StoreOperation::Load).await;
                 }
-                Err(error) if error.is_connection_issue() => {
-                    drop(mode);
-                    self.mark_degraded(StoreOperation::Load, &error).await;
-                    let mut mode = self.mode.lock().await;
-                    *mode = ResilientMode::MemoryOnly;
-                    drop(mode);
-                    self.load_mirror(job_id).await
-                }
-                Err(error) => Err(error),
-            },
-            ResilientMode::MemoryOnly => {
-                drop(mode);
+                Ok(state)
+            }
+            Err(error) if error.is_connection_issue() => {
+                self.mark_degraded(StoreOperation::Load, &error).await;
                 self.load_mirror(job_id).await
             }
+            Err(error) => Err(error),
         }
     }
 
     async fn save(&self, state: &JobState) -> Result<(), Self::Error> {
-        let mut mode = self.mode.lock().await;
+        self.save_mirror(state).await?;
+        if self.is_degraded() {
+            self.record_dirty(state.job_id.clone(), Some(state.clone()))
+                .await;
+            self.mark_recovering(StoreOperation::Save).await;
+        }
 
-        match &mut *mode {
-            ResilientMode::Primary(store) => match store.save(state).await {
-                Ok(()) => {
-                    drop(mode);
-                    self.save_mirror(state).await
-                }
-                Err(error) if error.is_connection_issue() => {
-                    drop(mode);
-                    self.mark_degraded(StoreOperation::Save, &error).await;
-                    self.save_mirror(state).await?;
-                    let mut mode = self.mode.lock().await;
-                    *mode = ResilientMode::MemoryOnly;
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            ResilientMode::MemoryOnly => {
-                drop(mode);
-                self.save_mirror(state).await
+        match self.primary.save(state).await {
+            Ok(()) => {
+                self.clear_dirty(&state.job_id, StoreOperation::Save).await;
+                Ok(())
             }
+            Err(error) if error.is_connection_issue() => {
+                self.mark_degraded(StoreOperation::Save, &error).await;
+                self.record_dirty(state.job_id.clone(), Some(state.clone()))
+                    .await;
+                if self.is_degraded() {
+                    self.mark_recovery_failed(StoreOperation::Save, &error)
+                        .await;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
     async fn delete(&self, job_id: &str) -> Result<(), Self::Error> {
-        let mut mode = self.mode.lock().await;
+        self.delete_mirror(job_id).await?;
+        if self.is_degraded() {
+            self.record_dirty(job_id.to_string(), None).await;
+            self.mark_recovering(StoreOperation::Delete).await;
+        }
 
-        match &mut *mode {
-            ResilientMode::Primary(store) => match store.delete(job_id).await {
-                Ok(()) => {
-                    drop(mode);
-                    self.delete_mirror(job_id).await
-                }
-                Err(error) if error.is_connection_issue() => {
-                    drop(mode);
-                    self.mark_degraded(StoreOperation::Delete, &error).await;
-                    self.delete_mirror(job_id).await?;
-                    let mut mode = self.mode.lock().await;
-                    *mode = ResilientMode::MemoryOnly;
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            ResilientMode::MemoryOnly => {
-                drop(mode);
-                self.delete_mirror(job_id).await
+        match self.primary.delete(job_id).await {
+            Ok(()) => {
+                self.clear_dirty(job_id, StoreOperation::Delete).await;
+                Ok(())
             }
+            Err(error) if error.is_connection_issue() => {
+                self.mark_degraded(StoreOperation::Delete, &error).await;
+                self.record_dirty(job_id.to_string(), None).await;
+                if self.is_degraded() {
+                    self.mark_recovery_failed(StoreOperation::Delete, &error)
+                        .await;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 

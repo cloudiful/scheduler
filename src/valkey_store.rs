@@ -1,7 +1,13 @@
 use crate::error::StoreErrorKind;
 use crate::model::JobState;
-use crate::store::{ResilientStateStore, ResilientStoreError, StateStore};
-use redis::{AsyncCommands, Client, ErrorKind, ServerErrorKind, aio::ConnectionManager};
+use crate::store::{
+    ResilientStateStore, ResilientStoreError, StateStore, StoreEvent, StoreOperation,
+};
+use crate::valkey_runtime::{
+    ValkeyCommandOutcome, ValkeyRecoveryConfig, ValkeyRuntime, ValkeyRuntimeEvent,
+    is_connection_issue,
+};
+use redis::{AsyncCommands, Client};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -10,7 +16,7 @@ const LEGACY_DEFAULT_KEY_PREFIX: &str = "scheduler:job-state:";
 
 #[derive(Debug, Clone)]
 pub struct ValkeyStateStore {
-    connection: ConnectionManager,
+    runtime: ValkeyRuntime,
     key_prefix: String,
 }
 
@@ -31,17 +37,42 @@ impl ValkeyStateStore {
         url: impl AsRef<str>,
         key_prefix: impl Into<String>,
     ) -> Result<Self, redis::RedisError> {
+        Self::with_prefix_and_recovery_config(url, key_prefix, ValkeyRecoveryConfig::default())
+            .await
+    }
+
+    pub async fn with_recovery_config(
+        url: impl AsRef<str>,
+        config: ValkeyRecoveryConfig,
+    ) -> Result<Self, redis::RedisError> {
+        Self::with_prefix_and_recovery_config(url, DEFAULT_KEY_PREFIX, config).await
+    }
+
+    pub async fn with_prefix_and_recovery_config(
+        url: impl AsRef<str>,
+        key_prefix: impl Into<String>,
+        config: ValkeyRecoveryConfig,
+    ) -> Result<Self, redis::RedisError> {
         let client = Client::open(url.as_ref())?;
-        Self::from_client(client, key_prefix).await
+        Self::from_client_with_recovery_config(client, key_prefix, config).await
     }
 
     pub async fn from_client(
         client: Client,
         key_prefix: impl Into<String>,
     ) -> Result<Self, redis::RedisError> {
-        let connection = client.get_connection_manager().await?;
+        Self::from_client_with_recovery_config(client, key_prefix, ValkeyRecoveryConfig::default())
+            .await
+    }
+
+    pub async fn from_client_with_recovery_config(
+        client: Client,
+        key_prefix: impl Into<String>,
+        config: ValkeyRecoveryConfig,
+    ) -> Result<Self, redis::RedisError> {
+        let runtime = ValkeyRuntime::from_client(client, config).await?;
         Ok(Self {
-            connection,
+            runtime,
             key_prefix: key_prefix.into(),
         })
     }
@@ -89,6 +120,7 @@ fn state_key(prefix: &str, job_id: &str) -> String {
 pub enum ValkeyStoreError {
     Redis(redis::RedisError),
     Codec(serde_json::Error),
+    Unavailable,
 }
 
 impl Display for ValkeyStoreError {
@@ -96,6 +128,7 @@ impl Display for ValkeyStoreError {
         match self {
             ValkeyStoreError::Redis(error) => write!(f, "{error}"),
             ValkeyStoreError::Codec(error) => write!(f, "{error}"),
+            ValkeyStoreError::Unavailable => write!(f, "valkey is temporarily unavailable"),
         }
     }
 }
@@ -105,6 +138,7 @@ impl Error for ValkeyStoreError {
         match self {
             ValkeyStoreError::Redis(error) => Some(error),
             ValkeyStoreError::Codec(error) => Some(error),
+            ValkeyStoreError::Unavailable => None,
         }
     }
 }
@@ -124,20 +158,8 @@ impl From<serde_json::Error> for ValkeyStoreError {
 impl ValkeyStoreError {
     pub fn is_connection_issue(&self) -> bool {
         match self {
-            Self::Redis(error) => {
-                error.is_connection_dropped()
-                    || error.is_connection_refusal()
-                    || error.is_timeout()
-                    || matches!(
-                        error.kind(),
-                        ErrorKind::Io
-                            | ErrorKind::ClusterConnectionNotFound
-                            | ErrorKind::Server(ServerErrorKind::BusyLoading)
-                            | ErrorKind::Server(ServerErrorKind::ClusterDown)
-                            | ErrorKind::Server(ServerErrorKind::MasterDown)
-                            | ErrorKind::Server(ServerErrorKind::TryAgain)
-                    )
-            }
+            Self::Redis(error) => is_connection_issue(error),
+            Self::Unavailable => true,
             Self::Codec(_) => false,
         }
     }
@@ -153,24 +175,32 @@ impl StateStore for ValkeyStateStore {
     type Error = ValkeyStoreError;
 
     async fn load(&self, job_id: &str) -> Result<Option<JobState>, Self::Error> {
-        let mut connection = self.connection.clone();
-        let payload: Option<String> = connection
-            .get(self.state_key(job_id))
+        let state_key = self.state_key(job_id);
+        let legacy_key = self.legacy_state_key(job_id);
+        let payload = self
+            .runtime
+            .execute(move |mut connection| {
+                let state_key = state_key.clone();
+                let legacy_key = legacy_key.clone();
+                async move {
+                    let payload: Option<String> = connection.get(state_key).await?;
+                    match payload {
+                        Some(payload) => Ok(Some(payload)),
+                        None => {
+                            if let Some(legacy_key) = legacy_key {
+                                connection.get(legacy_key).await
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                    }
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
 
-        let payload = match payload {
-            Some(payload) => Some(payload),
-            None => {
-                if let Some(legacy_key) = self.legacy_state_key(job_id) {
-                    connection
-                        .get(legacy_key)
-                        .await
-                        .map_err(ValkeyStoreError::from)?
-                } else {
-                    None
-                }
-            }
+        let ValkeyCommandOutcome::Available(payload) = payload else {
+            return Err(ValkeyStoreError::Unavailable);
         };
 
         payload
@@ -179,29 +209,64 @@ impl StateStore for ValkeyStateStore {
     }
 
     async fn save(&self, state: &JobState) -> Result<(), Self::Error> {
-        let mut connection = self.connection.clone();
+        let key = self.state_key(&state.job_id);
         let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
-        connection
-            .set(self.state_key(&state.job_id), payload)
+        let result = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                let payload = payload.clone();
+                async move { connection.set(key, payload).await }
+            })
             .await
-            .map_err(ValkeyStoreError::from)
+            .map_err(ValkeyStoreError::from)?;
+        match result {
+            ValkeyCommandOutcome::Available(()) => Ok(()),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn delete(&self, job_id: &str) -> Result<(), Self::Error> {
-        let mut connection = self.connection.clone();
-        let _: usize = connection
-            .del(self.state_key(job_id))
+        let state_key = self.state_key(job_id);
+        let legacy_key = self.legacy_state_key(job_id);
+        let result = self
+            .runtime
+            .execute(move |mut connection| {
+                let state_key = state_key.clone();
+                let legacy_key = legacy_key.clone();
+                async move {
+                    let _: usize = connection.del(state_key).await?;
+                    if let Some(legacy_key) = legacy_key {
+                        let _: usize = connection.del(legacy_key).await?;
+                    }
+                    Ok(())
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
 
-        if let Some(legacy_key) = self.legacy_state_key(job_id) {
-            let _: usize = connection
-                .del(legacy_key)
-                .await
-                .map_err(ValkeyStoreError::from)?;
+        match result {
+            ValkeyCommandOutcome::Available(()) => Ok(()),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
         }
+    }
 
-        Ok(())
+    async fn drain_events(&self) -> Result<Vec<StoreEvent>, Self::Error> {
+        Ok(self
+            .runtime
+            .drain_events()
+            .await
+            .into_iter()
+            .map(|event| match event {
+                ValkeyRuntimeEvent::Degraded { error } => StoreEvent::Degraded {
+                    operation: StoreOperation::Save,
+                    error,
+                },
+                ValkeyRuntimeEvent::Recovered => StoreEvent::Recovered {
+                    operation: StoreOperation::Save,
+                },
+            })
+            .collect())
     }
 
     fn classify_error(error: &Self::Error) -> StoreErrorKind

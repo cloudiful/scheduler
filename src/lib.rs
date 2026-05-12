@@ -67,6 +67,8 @@ mod valkey_execution_support;
 #[cfg(feature = "valkey-guard")]
 mod valkey_guard;
 #[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
+mod valkey_runtime;
+#[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
 mod valkey_scripts;
 #[cfg(feature = "valkey-store")]
 mod valkey_store;
@@ -80,8 +82,8 @@ pub use error::{
     StoreError, StoreErrorKind, TaskJoinError, TaskJoinErrorKind,
 };
 pub use execution_guard::{
-    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardRenewal, ExecutionGuardScope,
-    ExecutionLease, ExecutionSlot, NoopExecutionGuard,
+    ExecutionGuard, ExecutionGuardAcquire, ExecutionGuardEvent, ExecutionGuardRenewal,
+    ExecutionGuardScope, ExecutionLease, ExecutionSlot, NoopExecutionGuard,
 };
 pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
@@ -103,5 +105,7 @@ pub use store::{
 pub use valkey_coordinated_store::ValkeyCoordinatedStateStore;
 #[cfg(feature = "valkey-guard")]
 pub use valkey_guard::{ValkeyExecutionGuard, ValkeyLeaseConfig};
+#[cfg(any(feature = "valkey-guard", feature = "valkey-store"))]
+pub use valkey_runtime::ValkeyRecoveryConfig;
 #[cfg(feature = "valkey-store")]
 pub use valkey_store::ValkeyStateStore;

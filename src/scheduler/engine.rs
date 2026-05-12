@@ -213,6 +213,36 @@ where
                         error,
                     });
                 }
+                StoreEvent::Recovering { operation } => {
+                    self.emit(SchedulerEvent::StoreRecovering {
+                        job_id: job_id.to_string(),
+                        operation,
+                    });
+                }
+                StoreEvent::Recovered { operation } => {
+                    self.emit(SchedulerEvent::StoreRecovered {
+                        job_id: job_id.to_string(),
+                        operation,
+                    });
+                }
+                StoreEvent::RecoveryFailed { operation, error } => {
+                    self.emit(SchedulerEvent::StoreRecoveryFailed {
+                        job_id: job_id.to_string(),
+                        operation,
+                        error,
+                    });
+                }
+                StoreEvent::RecoveryConflict {
+                    operation,
+                    job_id,
+                    error,
+                } => {
+                    self.emit(SchedulerEvent::StoreRecoveryConflict {
+                        job_id,
+                        operation,
+                        error,
+                    });
+                }
             }
         }
         Ok(())

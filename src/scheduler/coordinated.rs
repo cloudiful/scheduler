@@ -13,6 +13,7 @@ use crate::coordinated_store::{
     CoordinatedStateStore,
 };
 use crate::error::SchedulerError;
+use crate::error::{ExecutionGuardErrorKind, StoreErrorKind};
 use crate::model::{Job, JobState, RunRecord};
 use crate::observer::{PauseScope, StateLoadSource};
 use std::collections::VecDeque;
@@ -68,7 +69,12 @@ where
         job: &Job<D>,
         _runtime: CoordinatedRuntimeState,
     ) -> Result<CoordinatedRuntimeState, SchedulerError> {
-        load_or_initialize_coordinated_state(scheduler, self.store.as_ref(), job, false).await
+        match load_or_initialize_coordinated_state(scheduler, self.store.as_ref(), job, false).await
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) if is_store_connection_error(&error) => Ok(_runtime),
+            Err(error) => Err(error),
+        }
     }
 
     fn state<'a>(&self, runtime: &'a CoordinatedRuntimeState) -> &'a JobState {
@@ -90,14 +96,18 @@ where
         runtime: &mut CoordinatedRuntimeState,
         state: &JobState,
     ) -> Result<bool, SchedulerError> {
-        let saved = self
+        let saved = match self
             .store
             .save_state(&job.job_id, runtime.revision, state)
             .await
             .map_err(|error| {
                 let kind = C::classify_store_error(&error);
                 SchedulerError::store(error, kind)
-            })?;
+            }) {
+            Ok(saved) => saved,
+            Err(error) if is_store_connection_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         if saved {
             runtime.revision += 1;
             runtime.state = state.clone();
@@ -113,7 +123,7 @@ where
         trigger: PendingTrigger,
         active: &mut JoinSet<CoordinatedCompletedRun>,
     ) -> Result<bool, SchedulerError> {
-        let claim = self
+        let claim = match self
             .store
             .claim_trigger(
                 &job.job_id,
@@ -131,7 +141,11 @@ where
             .map_err(|error| {
                 let kind = C::classify_guard_error(&error);
                 SchedulerError::execution_guard(error, kind)
-            })?;
+            }) {
+            Ok(claim) => claim,
+            Err(error) if is_guard_connection_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         if let Some(claim) = claim {
             scheduler.emit(execution_guard_acquired(
                 &claim.lease,
@@ -160,15 +174,19 @@ where
         runtime: &mut CoordinatedRuntimeState,
         active: &mut JoinSet<CoordinatedCompletedRun>,
     ) -> Result<bool, SchedulerError> {
-        if let Some(claim) = self
+        let claim = match self
             .store
             .reclaim_inflight(&job.job_id, &job.execution_resource_id, self.lease_config)
             .await
             .map_err(|error| {
                 let kind = C::classify_guard_error(&error);
                 SchedulerError::execution_guard(error, kind)
-            })?
-        {
+            }) {
+            Ok(claim) => claim,
+            Err(error) if is_guard_connection_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if let Some(claim) = claim {
             scheduler.emit(execution_guard_acquired(
                 &claim.lease,
                 claim.trigger.catch_up,
@@ -201,7 +219,7 @@ where
     ) -> Result<bool, SchedulerError> {
         match overlap_action {
             OverlapAction::Spawn(trigger) => {
-                let claim = self
+                let claim = match self
                     .store
                     .claim_trigger(
                         &job.job_id,
@@ -219,7 +237,11 @@ where
                     .map_err(|error| {
                         let kind = C::classify_guard_error(&error);
                         SchedulerError::execution_guard(error, kind)
-                    })?;
+                    }) {
+                    Ok(claim) => claim,
+                    Err(error) if is_guard_connection_error(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
                 if let Some(claim) = claim {
                     *runtime = claim.state.clone();
                     scheduler.emit(trigger_emitted(
@@ -247,14 +269,18 @@ where
                 Ok(false)
             }
             OverlapAction::QueueUpdated | OverlapAction::Dropped => {
-                let saved = self
+                let saved = match self
                     .store
                     .save_state(&job.job_id, runtime.revision, &candidate_state)
                     .await
                     .map_err(|error| {
                         let kind = C::classify_store_error(&error);
                         SchedulerError::store(error, kind)
-                    })?;
+                    }) {
+                    Ok(saved) => saved,
+                    Err(error) if is_store_connection_error(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
                 if saved {
                     runtime.revision += 1;
                     runtime.state = candidate_state;
@@ -271,14 +297,19 @@ where
         history: &mut VecDeque<RunRecord>,
         completed: CoordinatedCompletedRun,
     ) -> Result<(), SchedulerError> {
-        apply_completed_coordinated_run(
+        match apply_completed_coordinated_run(
             scheduler,
             self.store.as_ref(),
             &mut runtime.state,
             history,
             completed,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if is_store_connection_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
         runtime.revision += 1;
         Ok(())
     }
@@ -289,10 +320,14 @@ where
         job: &Job<D>,
         runtime: &mut CoordinatedRuntimeState,
     ) -> Result<(), SchedulerError> {
-        self.store.delete(&job.job_id).await.map_err(|error| {
+        match self.store.delete(&job.job_id).await.map_err(|error| {
             let kind = C::classify_store_error(&error);
             SchedulerError::store(error, kind)
-        })?;
+        }) {
+            Ok(()) => {}
+            Err(error) if is_store_connection_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
         runtime.state.next_run_at = None;
         Ok(())
     }
@@ -303,10 +338,14 @@ where
         job: &Job<D>,
         _runtime: &mut CoordinatedRuntimeState,
     ) -> Result<bool, SchedulerError> {
-        self.store.pause(&job.job_id).await.map_err(|error| {
+        match self.store.pause(&job.job_id).await.map_err(|error| {
             let kind = C::classify_store_error(&error);
             SchedulerError::store(error, kind)
-        })
+        }) {
+            Ok(changed) => Ok(changed),
+            Err(error) if is_store_connection_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn resume(
@@ -315,11 +354,30 @@ where
         job: &Job<D>,
         _runtime: &mut CoordinatedRuntimeState,
     ) -> Result<bool, SchedulerError> {
-        self.store.resume(&job.job_id).await.map_err(|error| {
+        match self.store.resume(&job.job_id).await.map_err(|error| {
             let kind = C::classify_store_error(&error);
             SchedulerError::store(error, kind)
-        })
+        }) {
+            Ok(changed) => Ok(changed),
+            Err(error) if is_store_connection_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn is_store_connection_error(error: &SchedulerError) -> bool {
+    matches!(
+        error,
+        SchedulerError::Store(store_error) if store_error.kind() == StoreErrorKind::Connection
+    )
+}
+
+fn is_guard_connection_error(error: &SchedulerError) -> bool {
+    matches!(
+        error,
+        SchedulerError::ExecutionGuard(guard_error)
+            if guard_error.kind() == ExecutionGuardErrorKind::Connection
+    )
 }
 
 async fn load_or_initialize_coordinated_state<S, G, C, D>(

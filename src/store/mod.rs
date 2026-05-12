@@ -56,6 +56,21 @@ pub enum StoreEvent {
         operation: StoreOperation,
         error: String,
     },
+    Recovering {
+        operation: StoreOperation,
+    },
+    Recovered {
+        operation: StoreOperation,
+    },
+    RecoveryFailed {
+        operation: StoreOperation,
+        error: String,
+    },
+    RecoveryConflict {
+        operation: StoreOperation,
+        job_id: String,
+        error: String,
+    },
 }
 
 impl<T> StateStore for Arc<T>

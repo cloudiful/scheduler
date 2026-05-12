@@ -8,11 +8,12 @@ use crate::model::JobState;
 use crate::valkey_execution_support::{
     next_token, now_millis, occurrence_index_key, occurrence_lease_key, resource_lock_key,
 };
+use crate::valkey_runtime::{ValkeyCommandOutcome, ValkeyRecoveryConfig, ValkeyRuntime};
 use crate::valkey_scripts;
 use crate::valkey_store::ValkeyStoreError;
 use chrono::SecondsFormat;
 use chrono::{DateTime, Utc};
-use redis::{AsyncCommands, Client, aio::ConnectionManager, cmd};
+use redis::{AsyncCommands, Client, cmd};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
@@ -36,7 +37,7 @@ static COORDINATED_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct ValkeyCoordinatedStateStore {
-    connection: ConnectionManager,
+    runtime: ValkeyRuntime,
     state_key_prefix: String,
     execution_key_prefix: String,
 }
@@ -51,10 +52,38 @@ impl ValkeyCoordinatedStateStore {
         state_key_prefix: impl Into<String>,
         execution_key_prefix: impl Into<String>,
     ) -> Result<Self, redis::RedisError> {
+        Self::with_prefixes_and_recovery_config(
+            url,
+            state_key_prefix,
+            execution_key_prefix,
+            ValkeyRecoveryConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_recovery_config(
+        url: impl AsRef<str>,
+        config: ValkeyRecoveryConfig,
+    ) -> Result<Self, redis::RedisError> {
+        Self::with_prefixes_and_recovery_config(
+            url,
+            DEFAULT_STATE_KEY_PREFIX,
+            DEFAULT_EXECUTION_KEY_PREFIX,
+            config,
+        )
+        .await
+    }
+
+    pub async fn with_prefixes_and_recovery_config(
+        url: impl AsRef<str>,
+        state_key_prefix: impl Into<String>,
+        execution_key_prefix: impl Into<String>,
+        config: ValkeyRecoveryConfig,
+    ) -> Result<Self, redis::RedisError> {
         let client = Client::open(url.as_ref())?;
-        let connection = client.get_connection_manager().await?;
+        let runtime = ValkeyRuntime::from_client(client, config).await?;
         Ok(Self {
-            connection,
+            runtime,
             state_key_prefix: state_key_prefix.into(),
             execution_key_prefix: execution_key_prefix.into(),
         })
@@ -85,23 +114,37 @@ impl ValkeyCoordinatedStateStore {
     }
 
     async fn key_type(&self, key: &str) -> Result<String, ValkeyStoreError> {
-        let mut connection = self.connection.clone();
-        cmd("TYPE")
-            .arg(key)
-            .query_async(&mut connection)
+        let key = key.to_string();
+        let result: ValkeyCommandOutcome<String> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move { cmd("TYPE").arg(key).query_async(&mut connection).await }
+            })
             .await
-            .map_err(ValkeyStoreError::from)
+            .map_err(ValkeyStoreError::from)?;
+        match result {
+            ValkeyCommandOutcome::Available(value) => Ok(value),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn load_hash(
         &self,
         key: &str,
     ) -> Result<Option<CoordinatedRuntimeState>, ValkeyStoreError> {
-        let mut connection = self.connection.clone();
-        let fields: HashMap<String, String> = connection
-            .hgetall(key)
+        let key = key.to_string();
+        let result: ValkeyCommandOutcome<HashMap<String, String>> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move { connection.hgetall(key).await }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
+        let ValkeyCommandOutcome::Available(fields) = result else {
+            return Err(ValkeyStoreError::Unavailable);
+        };
         if fields.is_empty() {
             return Ok(None);
         }
@@ -129,30 +172,52 @@ impl ValkeyCoordinatedStateStore {
         key: &str,
         runtime: &CoordinatedRuntimeState,
     ) -> Result<(), ValkeyStoreError> {
-        let mut connection = self.connection.clone();
         let payload = serde_json::to_string(&runtime.state).map_err(ValkeyStoreError::from)?;
-        let _: () = cmd("DEL")
-            .arg(key)
-            .query_async(&mut connection)
+        let key = key.to_string();
+        let revision = runtime.revision;
+        let paused = runtime.paused;
+        let result = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                let payload = payload.clone();
+                async move {
+                    let _: () = cmd("DEL").arg(&key).query_async(&mut connection).await?;
+                    let _: () = cmd("HSET")
+                        .arg(key)
+                        .arg(FIELD_VERSION)
+                        .arg(revision)
+                        .arg(FIELD_STATE)
+                        .arg(payload)
+                        .arg(FIELD_PAUSED)
+                        .arg(if paused { "1" } else { "0" })
+                        .query_async(&mut connection)
+                        .await?;
+                    Ok(())
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        let _: () = cmd("HSET")
-            .arg(key)
-            .arg(FIELD_VERSION)
-            .arg(runtime.revision)
-            .arg(FIELD_STATE)
-            .arg(payload)
-            .arg(FIELD_PAUSED)
-            .arg(if runtime.paused { "1" } else { "0" })
-            .query_async(&mut connection)
-            .await
-            .map_err(ValkeyStoreError::from)?;
-        Ok(())
+        match result {
+            ValkeyCommandOutcome::Available(()) => Ok(()),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn load_payload_state(&self, key: &str) -> Result<Option<String>, ValkeyStoreError> {
-        let mut connection = self.connection.clone();
-        connection.get(key).await.map_err(ValkeyStoreError::from)
+        let key = key.to_string();
+        let result = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move { connection.get(key).await }
+            })
+            .await
+            .map_err(ValkeyStoreError::from)?;
+        match result {
+            ValkeyCommandOutcome::Available(value) => Ok(value),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 }
 
@@ -184,12 +249,22 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
             if self.key_type(&legacy_key).await?.as_str() == "string" {
                 if let Some(payload) = self.load_payload_state(&legacy_key).await? {
                     let runtime = self.migrate_string_state(&key, payload).await?;
-                    let mut connection = self.connection.clone();
-                    let _: () = cmd("DEL")
-                        .arg(legacy_key)
-                        .query_async(&mut connection)
+                    let result: ValkeyCommandOutcome<()> = self
+                        .runtime
+                        .execute(move |mut connection| {
+                            let legacy_key = legacy_key.clone();
+                            async move {
+                                cmd("DEL")
+                                    .arg(legacy_key)
+                                    .query_async(&mut connection)
+                                    .await
+                            }
+                        })
                         .await
                         .map_err(ValkeyStoreError::from)?;
+                    if matches!(result, ValkeyCommandOutcome::Degraded) {
+                        return Err(ValkeyStoreError::Unavailable);
+                    }
                     return Ok(runtime);
                 }
             }
@@ -212,18 +287,29 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
     ) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
         let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
-        let mut connection = self.connection.clone();
-        let updated: i32 = valkey_scripts::script(valkey_scripts::coordinated::SAVE_STATE)
-            .key(key)
-            .arg(FIELD_VERSION)
-            .arg(revision)
-            .arg(FIELD_INFLIGHT_TOKEN)
-            .arg(FIELD_STATE)
-            .arg(payload)
-            .invoke_async(&mut connection)
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                let payload = payload.clone();
+                async move {
+                    valkey_scripts::script(valkey_scripts::coordinated::SAVE_STATE)
+                        .key(key)
+                        .arg(FIELD_VERSION)
+                        .arg(revision)
+                        .arg(FIELD_INFLIGHT_TOKEN)
+                        .arg(FIELD_STATE)
+                        .arg(payload)
+                        .invoke_async(&mut connection)
+                        .await
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        Ok(updated == 1)
+        match result {
+            ValkeyCommandOutcome::Available(updated) => Ok(updated == 1),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn reclaim_inflight(
@@ -238,39 +324,58 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let ttl_millis = u64::try_from(lease_config.ttl.as_millis()).unwrap_or(u64::MAX);
         let now_millis = now_millis();
         let expires_at_millis = now_millis.saturating_add(ttl_millis);
-        let mut connection = self.connection.clone();
-        let result: Option<Vec<String>> =
-            valkey_scripts::script(valkey_scripts::coordinated::RECLAIM_INFLIGHT)
-                .key(key)
-                .key(self.resource_lock_key(resource_id))
-                .key(lease_key.clone())
-                .key(self.occurrence_index_key(resource_id))
-                // ARGV layout:
-                //  1..9  = hash field names read from KEYS[1]
-                // 10..14 = reclaim timing + new lease payload
-                // 15..16 = hash field names updated on successful reclaim
-                .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-                .arg(FIELD_INFLIGHT_CATCH_UP)
-                .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-                .arg(FIELD_INFLIGHT_RESOURCE_ID)
-                .arg(FIELD_INFLIGHT_SCOPE)
-                .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-                .arg(FIELD_STATE)
-                .arg(FIELD_VERSION)
-                .arg(FIELD_PAUSED)
-                .arg(now_millis)
-                .arg(format!(
-                    "{}{}:occurrence:",
-                    self.execution_key_prefix, resource_id
-                ))
-                .arg(&token)
-                .arg(ttl_millis)
-                .arg(expires_at_millis)
-                .arg(FIELD_INFLIGHT_TOKEN)
-                .arg(FIELD_INFLIGHT_LEASE_KEY)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(ValkeyStoreError::from)?;
+        let resource_lock_key = self.resource_lock_key(resource_id);
+        let occurrence_index_key = self.occurrence_index_key(resource_id);
+        let occurrence_prefix = format!("{}{}:occurrence:", self.execution_key_prefix, resource_id);
+        let result: ValkeyCommandOutcome<Option<Vec<String>>> = self
+            .runtime
+            .execute({
+                let token = token.clone();
+                let lease_key = lease_key.clone();
+                move |mut connection| {
+                    let key = key.clone();
+                    let resource_lock_key = resource_lock_key.clone();
+                    let lease_key = lease_key.clone();
+                    let occurrence_index_key = occurrence_index_key.clone();
+                    let occurrence_prefix = occurrence_prefix.clone();
+                    let token = token.clone();
+                    async move {
+                        valkey_scripts::script(valkey_scripts::coordinated::RECLAIM_INFLIGHT)
+                            .key(key)
+                            .key(resource_lock_key)
+                            .key(lease_key)
+                            .key(occurrence_index_key)
+                            // ARGV layout:
+                            //  1..9  = hash field names read from KEYS[1]
+                            // 10..14 = reclaim timing + new lease payload
+                            // 15..16 = hash field names updated on successful reclaim
+                            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+                            .arg(FIELD_INFLIGHT_CATCH_UP)
+                            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+                            .arg(FIELD_INFLIGHT_RESOURCE_ID)
+                            .arg(FIELD_INFLIGHT_SCOPE)
+                            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+                            .arg(FIELD_STATE)
+                            .arg(FIELD_VERSION)
+                            .arg(FIELD_PAUSED)
+                            .arg(now_millis)
+                            .arg(occurrence_prefix)
+                            .arg(&token)
+                            .arg(ttl_millis)
+                            .arg(expires_at_millis)
+                            .arg(FIELD_INFLIGHT_TOKEN)
+                            .arg(FIELD_INFLIGHT_LEASE_KEY)
+                            .invoke_async(&mut connection)
+                            .await
+                    }
+                }
+            })
+            .await
+            .map_err(ValkeyStoreError::from)?;
+
+        let ValkeyCommandOutcome::Available(result) = result else {
+            return Err(ValkeyStoreError::Unavailable);
+        };
 
         let Some(values) = result else {
             return Ok(None);
@@ -330,42 +435,68 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
         let expires_at_millis = now_millis.saturating_add(ttl_millis);
         let next_state_payload =
             serde_json::to_string(next_state).map_err(ValkeyStoreError::from)?;
-        let mut connection = self.connection.clone();
-        let new_revision: i64 = valkey_scripts::script(valkey_scripts::coordinated::CLAIM_TRIGGER)
-            .key(key)
-            .key(self.resource_lock_key(resource_id))
-            .key(&lease_key)
-            .key(self.occurrence_index_key(resource_id))
-            .arg(FIELD_VERSION)
-            .arg(FIELD_INFLIGHT_TOKEN)
-            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-            .arg(FIELD_PAUSED)
-            .arg(now_millis)
-            .arg(revision)
-            .arg(&token)
-            .arg(ttl_millis)
-            .arg(expires_at_millis)
-            .arg(FIELD_STATE)
-            .arg(next_state_payload)
-            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-            .arg(
-                trigger
-                    .scheduled_at
-                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .arg(FIELD_INFLIGHT_CATCH_UP)
-            .arg(trigger.catch_up)
-            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-            .arg(trigger.trigger_count)
-            .arg(FIELD_INFLIGHT_RESOURCE_ID)
-            .arg(resource_id)
-            .arg(FIELD_INFLIGHT_SCOPE)
-            .arg("occurrence")
-            .arg(FIELD_INFLIGHT_TOKEN)
-            .arg(FIELD_INFLIGHT_LEASE_KEY)
-            .invoke_async(&mut connection)
+        let resource_lock_key = self.resource_lock_key(resource_id);
+        let occurrence_index_key = self.occurrence_index_key(resource_id);
+        let scheduled_at = trigger
+            .scheduled_at
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let resource_id_arg = resource_id.to_string();
+        let command_trigger = trigger.clone();
+        let result: ValkeyCommandOutcome<i64> = self
+            .runtime
+            .execute({
+                let token = token.clone();
+                let lease_key = lease_key.clone();
+                let command_trigger = command_trigger.clone();
+                move |mut connection| {
+                    let key = key.clone();
+                    let resource_lock_key = resource_lock_key.clone();
+                    let lease_key = lease_key.clone();
+                    let occurrence_index_key = occurrence_index_key.clone();
+                    let token = token.clone();
+                    let next_state_payload = next_state_payload.clone();
+                    let scheduled_at = scheduled_at.clone();
+                    let resource_id_arg = resource_id_arg.clone();
+                    let command_trigger = command_trigger.clone();
+                    async move {
+                        valkey_scripts::script(valkey_scripts::coordinated::CLAIM_TRIGGER)
+                            .key(key)
+                            .key(resource_lock_key)
+                            .key(&lease_key)
+                            .key(occurrence_index_key)
+                            .arg(FIELD_VERSION)
+                            .arg(FIELD_INFLIGHT_TOKEN)
+                            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+                            .arg(FIELD_PAUSED)
+                            .arg(now_millis)
+                            .arg(revision)
+                            .arg(&token)
+                            .arg(ttl_millis)
+                            .arg(expires_at_millis)
+                            .arg(FIELD_STATE)
+                            .arg(next_state_payload)
+                            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+                            .arg(scheduled_at)
+                            .arg(FIELD_INFLIGHT_CATCH_UP)
+                            .arg(command_trigger.catch_up)
+                            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+                            .arg(command_trigger.trigger_count)
+                            .arg(FIELD_INFLIGHT_RESOURCE_ID)
+                            .arg(resource_id_arg)
+                            .arg(FIELD_INFLIGHT_SCOPE)
+                            .arg("occurrence")
+                            .arg(FIELD_INFLIGHT_TOKEN)
+                            .arg(FIELD_INFLIGHT_LEASE_KEY)
+                            .invoke_async(&mut connection)
+                            .await
+                    }
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
+        let ValkeyCommandOutcome::Available(new_revision) = result else {
+            return Err(ValkeyStoreError::Unavailable);
+        };
 
         if new_revision <= 0 {
             return Ok(None);
@@ -397,18 +528,33 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
     ) -> Result<ExecutionGuardRenewal, Self::Error> {
         let ttl_millis = u64::try_from(lease_config.ttl.as_millis()).unwrap_or(u64::MAX);
         let expires_at_millis = now_millis().saturating_add(ttl_millis);
-        let mut connection = self.connection.clone();
-        let renewed: i32 = valkey_scripts::script(valkey_scripts::coordinated::RENEW_LEASE)
-            .key(&lease.lease_key)
-            .key(self.occurrence_index_key(&lease.resource_id))
-            .key(self.state_key(&lease.job_id))
-            .arg(&lease.token)
-            .arg(ttl_millis)
-            .arg(expires_at_millis)
-            .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
-            .invoke_async(&mut connection)
+        let lease = lease.clone();
+        let occurrence_index_key = self.occurrence_index_key(&lease.resource_id);
+        let state_key = self.state_key(&lease.job_id);
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let lease = lease.clone();
+                let occurrence_index_key = occurrence_index_key.clone();
+                let state_key = state_key.clone();
+                async move {
+                    valkey_scripts::script(valkey_scripts::coordinated::RENEW_LEASE)
+                        .key(&lease.lease_key)
+                        .key(occurrence_index_key)
+                        .key(state_key)
+                        .arg(&lease.token)
+                        .arg(ttl_millis)
+                        .arg(expires_at_millis)
+                        .arg(FIELD_INFLIGHT_LEASE_EXPIRES_AT)
+                        .invoke_async(&mut connection)
+                        .await
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
+        let ValkeyCommandOutcome::Available(renewed) = result else {
+            return Ok(ExecutionGuardRenewal::Lost);
+        };
         Ok(if renewed == 1 {
             ExecutionGuardRenewal::Renewed
         } else {
@@ -425,62 +571,102 @@ impl CoordinatedStateStore for ValkeyCoordinatedStateStore {
     ) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
         let payload = serde_json::to_string(state).map_err(ValkeyStoreError::from)?;
-        let mut connection = self.connection.clone();
-        let completed: i32 = valkey_scripts::script(valkey_scripts::coordinated::COMPLETE)
-            .key(key)
-            .key(&lease.lease_key)
-            .key(self.occurrence_index_key(&lease.resource_id))
-            .arg(FIELD_VERSION)
-            .arg(FIELD_INFLIGHT_TOKEN)
-            .arg(revision)
-            .arg(&lease.token)
-            .arg(FIELD_STATE)
-            .arg(payload)
-            .arg(FIELD_INFLIGHT_SCHEDULED_AT)
-            .arg(FIELD_INFLIGHT_CATCH_UP)
-            .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
-            .arg(FIELD_INFLIGHT_RESOURCE_ID)
-            .arg(FIELD_INFLIGHT_SCOPE)
-            .arg(FIELD_INFLIGHT_LEASE_KEY)
-            .invoke_async(&mut connection)
+        let lease = lease.clone();
+        let occurrence_index_key = self.occurrence_index_key(&lease.resource_id);
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                let lease = lease.clone();
+                let occurrence_index_key = occurrence_index_key.clone();
+                let payload = payload.clone();
+                async move {
+                    valkey_scripts::script(valkey_scripts::coordinated::COMPLETE)
+                        .key(key)
+                        .key(&lease.lease_key)
+                        .key(occurrence_index_key)
+                        .arg(FIELD_VERSION)
+                        .arg(FIELD_INFLIGHT_TOKEN)
+                        .arg(revision)
+                        .arg(&lease.token)
+                        .arg(FIELD_STATE)
+                        .arg(payload)
+                        .arg(FIELD_INFLIGHT_SCHEDULED_AT)
+                        .arg(FIELD_INFLIGHT_CATCH_UP)
+                        .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+                        .arg(FIELD_INFLIGHT_RESOURCE_ID)
+                        .arg(FIELD_INFLIGHT_SCOPE)
+                        .arg(FIELD_INFLIGHT_LEASE_KEY)
+                        .invoke_async(&mut connection)
+                        .await
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        Ok(completed == 1)
+        match result {
+            ValkeyCommandOutcome::Available(completed) => Ok(completed == 1),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn delete(&self, job_id: &str) -> Result<(), Self::Error> {
         let key = self.state_key(job_id);
-        let mut connection = self.connection.clone();
-        let _: () = cmd("DEL")
-            .arg(key)
-            .query_async(&mut connection)
+        let result = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move { cmd("DEL").arg(key).query_async(&mut connection).await }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        Ok(())
+        match result {
+            ValkeyCommandOutcome::Available(()) => Ok(()),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn pause(&self, job_id: &str) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
-        let mut connection = self.connection.clone();
-        let changed: i32 = valkey_scripts::script(valkey_scripts::coordinated::PAUSE)
-            .key(key)
-            .arg(FIELD_PAUSED)
-            .invoke_async(&mut connection)
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move {
+                    valkey_scripts::script(valkey_scripts::coordinated::PAUSE)
+                        .key(key)
+                        .arg(FIELD_PAUSED)
+                        .invoke_async(&mut connection)
+                        .await
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        Ok(changed == 1)
+        match result {
+            ValkeyCommandOutcome::Available(changed) => Ok(changed == 1),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     async fn resume(&self, job_id: &str) -> Result<bool, Self::Error> {
         let key = self.state_key(job_id);
-        let mut connection = self.connection.clone();
-        let changed: i32 = valkey_scripts::script(valkey_scripts::coordinated::RESUME)
-            .key(key)
-            .arg(FIELD_PAUSED)
-            .invoke_async(&mut connection)
+        let result: ValkeyCommandOutcome<i32> = self
+            .runtime
+            .execute(move |mut connection| {
+                let key = key.clone();
+                async move {
+                    valkey_scripts::script(valkey_scripts::coordinated::RESUME)
+                        .key(key)
+                        .arg(FIELD_PAUSED)
+                        .invoke_async(&mut connection)
+                        .await
+                }
+            })
             .await
             .map_err(ValkeyStoreError::from)?;
-        Ok(changed == 1)
+        match result {
+            ValkeyCommandOutcome::Available(changed) => Ok(changed == 1),
+            ValkeyCommandOutcome::Degraded => Err(ValkeyStoreError::Unavailable),
+        }
     }
 
     fn classify_store_error(error: &Self::Error) -> StoreErrorKind

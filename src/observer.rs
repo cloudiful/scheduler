@@ -134,6 +134,41 @@ pub enum SchedulerEvent {
         operation: StoreOperation,
         error: String,
     },
+    StoreRecovering {
+        job_id: String,
+        operation: StoreOperation,
+    },
+    StoreRecovered {
+        job_id: String,
+        operation: StoreOperation,
+    },
+    StoreRecoveryFailed {
+        job_id: String,
+        operation: StoreOperation,
+        error: String,
+    },
+    StoreRecoveryConflict {
+        job_id: String,
+        operation: StoreOperation,
+        error: String,
+    },
+    ExecutionGuardDegraded {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+        error: String,
+    },
+    ExecutionGuardRecovered {
+        job_id: String,
+        resource_id: String,
+        scope: ExecutionGuardScope,
+        scheduled_at: Option<DateTime<Utc>>,
+        catch_up: bool,
+        trigger_count: u32,
+    },
     TerminalStateDeleted {
         job_id: String,
         trigger_count: u32,
@@ -341,6 +376,53 @@ impl SchedulerObserver for LogObserver {
             } => warn!(
                 "scheduler store degraded job_id={} operation={:?} error={}",
                 job_id, operation, error
+            ),
+            SchedulerEvent::StoreRecovering { job_id, operation } => info!(
+                "scheduler store recovering job_id={} operation={:?}",
+                job_id, operation
+            ),
+            SchedulerEvent::StoreRecovered { job_id, operation } => info!(
+                "scheduler store recovered job_id={} operation={:?}",
+                job_id, operation
+            ),
+            SchedulerEvent::StoreRecoveryFailed {
+                job_id,
+                operation,
+                error,
+            } => warn!(
+                "scheduler store recovery failed job_id={} operation={:?} error={}",
+                job_id, operation, error
+            ),
+            SchedulerEvent::StoreRecoveryConflict {
+                job_id,
+                operation,
+                error,
+            } => warn!(
+                "scheduler store recovery conflict job_id={} operation={:?} error={}",
+                job_id, operation, error
+            ),
+            SchedulerEvent::ExecutionGuardDegraded {
+                job_id,
+                resource_id,
+                scope,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+                error,
+            } => warn!(
+                "scheduler execution guard degraded job_id={} resource_id={} scope={:?} scheduled_at={:?} catch_up={} trigger_count={} error={}",
+                job_id, resource_id, scope, scheduled_at, catch_up, trigger_count, error
+            ),
+            SchedulerEvent::ExecutionGuardRecovered {
+                job_id,
+                resource_id,
+                scope,
+                scheduled_at,
+                catch_up,
+                trigger_count,
+            } => info!(
+                "scheduler execution guard recovered job_id={} resource_id={} scope={:?} scheduled_at={:?} catch_up={} trigger_count={}",
+                job_id, resource_id, scope, scheduled_at, catch_up, trigger_count
             ),
             SchedulerEvent::TerminalStateDeleted {
                 job_id,

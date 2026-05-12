@@ -91,6 +91,12 @@ pub enum ExecutionGuardRenewal {
     Lost,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionGuardEvent {
+    Degraded { error: String },
+    Recovered,
+}
+
 pub trait ExecutionGuard {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -108,6 +114,12 @@ pub trait ExecutionGuard {
         &self,
         lease: &ExecutionLease,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn drain_events(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ExecutionGuardEvent>, Self::Error>> + Send {
+        async { Ok(Vec::new()) }
+    }
 
     fn classify_error(_error: &Self::Error) -> ExecutionGuardErrorKind
     where
@@ -163,6 +175,10 @@ where
 
     async fn release(&self, lease: &ExecutionLease) -> Result<(), Self::Error> {
         self.as_ref().release(lease).await
+    }
+
+    async fn drain_events(&self) -> Result<Vec<ExecutionGuardEvent>, Self::Error> {
+        self.as_ref().drain_events().await
     }
 
     fn classify_error(error: &Self::Error) -> ExecutionGuardErrorKind
