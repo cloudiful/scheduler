@@ -166,6 +166,7 @@ where
             crate::Schedule::Interval(_)
                 | crate::Schedule::StaggeredInterval(_)
                 | crate::Schedule::GroupedInterval(_)
+                | crate::Schedule::WindowedInterval(_)
         ) {
             return false;
         }
@@ -304,7 +305,10 @@ where
                 if grouped.every.is_zero() {
                     return Err(SchedulerError::invalid_zero_interval());
                 }
-                crate::scheduler::trigger_math::validate_grouped_interval(grouped)?;
+                crate::scheduler::interval_phase::validate_grouped_interval(grouped)?;
+            }
+            crate::Schedule::WindowedInterval(windowed) => {
+                crate::scheduler::windowed_interval::validate(windowed)?;
             }
             crate::Schedule::AtTimes(times) => times.sort_unstable(),
             crate::Schedule::Cron(_) => {}

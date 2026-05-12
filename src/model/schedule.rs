@@ -1,4 +1,4 @@
-use super::CronSchedule;
+use super::{CronSchedule, JobTimeWindow};
 use chrono::{DateTime, Utc};
 use chrono_tz::{Asia::Shanghai, Tz};
 use std::time::Duration;
@@ -46,6 +46,43 @@ impl GroupedIntervalSchedule {
     }
 }
 
+/// Interval override for a matching time window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntervalWindow {
+    pub window: JobTimeWindow,
+    pub every: Option<Duration>,
+}
+
+impl IntervalWindow {
+    pub fn new(window: JobTimeWindow, every: Option<Duration>) -> Self {
+        Self { window, every }
+    }
+}
+
+/// Interval schedule with per-window frequencies.
+///
+/// `None` means no trigger is produced while that frequency is active.
+/// Windows are evaluated in order; the first matching window wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowedIntervalSchedule {
+    pub default_every: Option<Duration>,
+    pub windows: Vec<IntervalWindow>,
+}
+
+impl WindowedIntervalSchedule {
+    pub fn new(default_every: Option<Duration>) -> Self {
+        Self {
+            default_every,
+            windows: Vec::new(),
+        }
+    }
+
+    pub fn with_window(mut self, window: JobTimeWindow, every: Option<Duration>) -> Self {
+        self.windows.push(IntervalWindow::new(window, every));
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Schedule {
     /// Trigger repeatedly after the given interval.
@@ -62,6 +99,8 @@ pub enum Schedule {
     /// index. An optional group seed can rotate the entire group without
     /// changing the spacing between members.
     GroupedInterval(GroupedIntervalSchedule),
+    /// Trigger repeatedly with frequencies selected by local time windows.
+    WindowedInterval(WindowedIntervalSchedule),
     /// Trigger at the listed wall-clock times.
     ///
     /// The list is sorted before execution starts. An empty list is treated as
@@ -155,6 +194,11 @@ impl Schedule {
             GroupedIntervalSchedule::new(every, group_size, member_index)
                 .with_group_seed(group_seed),
         )
+    }
+
+    /// Create a windowed interval schedule.
+    pub fn windowed_interval(default_every: Option<Duration>) -> Self {
+        Self::WindowedInterval(WindowedIntervalSchedule::new(default_every))
     }
 }
 

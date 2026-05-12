@@ -9,9 +9,10 @@ Links:
 - docs.rs: <https://docs.rs/cloudiful-scheduler>
 - crates.io: <https://crates.io/crates/cloudiful-scheduler>
 
-Version `0.4.3` exposes:
+Version `0.4.5` exposes:
 
 - explicit schedules via `Schedule::Interval`, `Schedule::StaggeredInterval`, `Schedule::GroupedInterval`, `Schedule::AtTimes`, or `Schedule::Cron`
+- windowed interval schedules via `Schedule::WindowedInterval` for different frequencies across local time windows
 - job-level execution windows via `JobTimeWindow`
 - missed-run handling via `MissedRunPolicy`
 - overlap control via `OverlapPolicy`
@@ -87,6 +88,7 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `Job::without_deps(job_id, schedule, task)` defines a task with no injected dependencies.
 - `Job::new(job_id, schedule, deps, task)` defines a task with explicit injected `deps`.
 - `Job::with_time_window(window)` restricts execution to local weekdays and time segments.
+- `Schedule::windowed_interval(default_every)` selects interval frequency by ordered `JobTimeWindow` rules; `None` means no triggers for that period.
 - `Scheduler::run(job)` runs until the schedule finishes or a control handle requests cancel or shutdown.
 - `SchedulerHandle::cancel()` stops while waiting.
 - `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
@@ -242,6 +244,52 @@ let job = Job::without_deps(
 
 let report = scheduler.run(job).await.unwrap();
 println!("skip reason: {:?}", report.last_skip_reason);
+```
+
+## Example: windowed interval frequencies
+
+Use `WindowedIntervalSchedule` when one job needs different trigger rates in
+different local periods. A matching window with `None` disables triggers for
+that period; `Job::with_time_window(...)` remains a separate hard execution
+filter.
+
+```rust
+use std::time::Duration;
+
+use chrono::{NaiveTime, Weekday};
+use chrono_tz::Asia::Shanghai;
+use scheduler::{
+    InMemoryStateStore, Job, JobTimeWindow, Schedule, Scheduler, SchedulerConfig, Task,
+    TimeWindowSegment, WindowedIntervalSchedule,
+};
+
+let market_open = JobTimeWindow {
+    timezone: Some(Shanghai),
+    weekdays: vec![Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri],
+    segments: vec![
+        TimeWindowSegment::new(
+            NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            NaiveTime::from_hms_opt(11, 30, 0).unwrap(),
+        ),
+        TimeWindowSegment::new(
+            NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
+        ),
+    ],
+};
+
+let schedule = WindowedIntervalSchedule::new(Some(Duration::from_secs(30 * 60)))
+    .with_window(market_open, Some(Duration::from_secs(30)));
+
+let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+let job = Job::without_deps(
+    "refresh-stocks",
+    Schedule::WindowedInterval(schedule),
+    Task::from_async(|_| async move {
+        // Fetch frequently during market hours and less often outside.
+        Ok(())
+    }),
+);
 ```
 
 ## Example: task with RunContext
