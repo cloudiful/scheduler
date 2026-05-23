@@ -90,9 +90,10 @@ pub use execution_guard::{
 pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
     CronSchedule, GroupedIntervalSchedule, IntervalWindow, Job, JobFuture, JobResult, JobState,
-    JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord, RunSkipReason, RunStatus,
-    Schedule, SchedulerConfig, SchedulerReport, StaggeredIntervalSchedule, Task, TaskContext,
-    TerminalStatePolicy, TimeWindowAlignment, TimeWindowSegment, WindowedIntervalSchedule,
+    JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord, RunSkipReason,
+    RunStatus, Schedule, SchedulerConfig, SchedulerReport, StaggeredIntervalSchedule, Task,
+    TaskContext, TerminalStatePolicy, TimeWindowAlignment, TimeWindowSegment, TriggerSource,
+    TriggeredTaskContext, WindowedIntervalSchedule,
 };
 pub use observer::{
     LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,

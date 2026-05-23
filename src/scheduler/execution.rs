@@ -1,5 +1,5 @@
 use crate::model::{
-    JobState, RunContext, RunRecord, RunStatus, TaskContext, TaskHandler, push_history,
+    JobState, RunContext, RunRecord, RunStatus, TaskHandler, TriggeredTaskContext, push_history,
 };
 use crate::observer::{SchedulerEvent, SchedulerObserver};
 use crate::scheduler::control::{ControlSignal, StopSignal};
@@ -73,7 +73,7 @@ pub(crate) fn spawn_legacy_trigger<D, G>(
         let started_at = Utc::now();
         let mut renewal_count = 0u32;
         let mut failed_renewal_count = 0u32;
-        let task_future = task(TaskContext {
+        let task_future = task(TriggeredTaskContext {
             run: RunContext {
                 job_id: job_id.clone(),
                 scheduled_at: trigger.scheduled_at,
@@ -81,6 +81,7 @@ pub(crate) fn spawn_legacy_trigger<D, G>(
                 timezone,
             },
             deps,
+            source: trigger.source,
         });
         tokio::pin!(task_future);
         let renew_every = guard.renew_interval(&lease);

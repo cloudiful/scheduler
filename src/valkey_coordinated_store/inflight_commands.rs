@@ -3,8 +3,9 @@ use super::codec::{parse_job_state, parse_utc_rfc3339};
 use super::keys::{
     FIELD_INFLIGHT_CATCH_UP, FIELD_INFLIGHT_LEASE_EXPIRES_AT, FIELD_INFLIGHT_LEASE_KEY,
     FIELD_INFLIGHT_RESOURCE_ID, FIELD_INFLIGHT_SCHEDULED_AT, FIELD_INFLIGHT_SCOPE,
-    FIELD_INFLIGHT_TOKEN, FIELD_INFLIGHT_TRIGGER_COUNT, FIELD_PAUSED, FIELD_STATE, FIELD_VERSION,
-    parse_scope, scope_to_str,
+    FIELD_INFLIGHT_SOURCE, FIELD_INFLIGHT_TOKEN, FIELD_INFLIGHT_TRIGGER_COUNT, FIELD_PAUSED,
+    FIELD_STATE, FIELD_VERSION, parse_scope, parse_trigger_source, scope_to_str,
+    trigger_source_to_str,
 };
 use crate::coordinated_store::{
     CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedPendingTrigger,
@@ -62,6 +63,7 @@ impl ValkeyCoordinatedStateStore {
                             .arg(FIELD_INFLIGHT_SCHEDULED_AT)
                             .arg(FIELD_INFLIGHT_CATCH_UP)
                             .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+                            .arg(FIELD_INFLIGHT_SOURCE)
                             .arg(FIELD_INFLIGHT_RESOURCE_ID)
                             .arg(FIELD_INFLIGHT_SCOPE)
                             .arg(FIELD_INFLIGHT_LEASE_KEY)
@@ -79,7 +81,7 @@ impl ValkeyCoordinatedStateStore {
             return Err(ValkeyStoreError::Unavailable);
         };
         result
-            .filter(|values| values.len() == 8)
+            .filter(|values| values.len() == 9)
             .map(|values| claim_from_script_values(job_id, resource_id, values, true))
             .transpose()
     }
@@ -117,6 +119,7 @@ impl ValkeyCoordinatedStateStore {
             .to_rfc3339_opts(SecondsFormat::Nanos, true);
         let resource_id_arg = resource_id.to_string();
         let scope_arg = scope_to_str(scope).to_string();
+        let source_arg = trigger_source_to_str(trigger.source).to_string();
         let command_trigger = trigger.clone();
         let result: ValkeyCommandOutcome<i64> = self
             .runtime
@@ -134,6 +137,7 @@ impl ValkeyCoordinatedStateStore {
                     let scheduled_at = scheduled_at.clone();
                     let resource_id_arg = resource_id_arg.clone();
                     let scope_arg = scope_arg.clone();
+                    let source_arg = source_arg.clone();
                     let command_trigger = command_trigger.clone();
                     async move {
                         valkey_scripts::script(valkey_scripts::coordinated::CLAIM_TRIGGER)
@@ -154,6 +158,7 @@ impl ValkeyCoordinatedStateStore {
                             .arg(scheduled_at)
                             .arg(command_trigger.catch_up)
                             .arg(command_trigger.trigger_count)
+                            .arg(source_arg)
                             .arg(resource_id_arg)
                             .arg(scope_arg)
                             .invoke_async(&mut connection)
@@ -284,6 +289,7 @@ impl ValkeyCoordinatedStateStore {
                         .arg(FIELD_INFLIGHT_SCHEDULED_AT)
                         .arg(FIELD_INFLIGHT_CATCH_UP)
                         .arg(FIELD_INFLIGHT_TRIGGER_COUNT)
+                        .arg(FIELD_INFLIGHT_SOURCE)
                         .arg(FIELD_INFLIGHT_RESOURCE_ID)
                         .arg(FIELD_INFLIGHT_LEASE_KEY)
                         .invoke_async(&mut connection)
@@ -310,7 +316,8 @@ fn claim_from_script_values(
     let scheduled_at = parse_utc_rfc3339(&values[2])?;
     let catch_up = values[3].parse::<bool>().unwrap_or(false);
     let trigger_count = values[4].parse::<u32>().unwrap_or(0);
-    let scope = parse_scope(&values[5]);
+    let source = parse_trigger_source(&values[5]);
+    let scope = parse_scope(&values[6]);
     Ok(CoordinatedClaim {
         state: CoordinatedRuntimeState {
             state,
@@ -321,14 +328,15 @@ fn claim_from_script_values(
             scheduled_at,
             catch_up,
             trigger_count,
+            source,
         },
         lease: ExecutionLease::new(
             job_id.to_string(),
             resource_id.to_string(),
             scope,
             Some(scheduled_at),
+            values[8].clone(),
             values[7].clone(),
-            values[6].clone(),
         ),
         replayed,
     })

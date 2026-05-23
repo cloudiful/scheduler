@@ -1,5 +1,6 @@
 use crate::error::SchedulerError;
-use std::collections::HashSet;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub(crate) enum CommandDisposition {
 pub(crate) struct ControlSignal {
     pub(crate) desired_mode: SchedulerMode,
     pub(crate) mode_command_seq: u64,
+    pub(crate) poke_seq: u64,
     pub(crate) command_disposition: CommandDisposition,
     pub(crate) stop_signal: Option<StopSignal>,
 }
@@ -37,6 +39,7 @@ impl ControlSignal {
         Self {
             desired_mode: SchedulerMode::Running,
             mode_command_seq: 0,
+            poke_seq: 0,
             command_disposition: CommandDisposition::Apply,
             stop_signal: None,
         }
@@ -55,9 +58,15 @@ pub(crate) trait PauseController: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<bool, SchedulerError>> + Send + 'a>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManualTriggerRequest {
+    pub(crate) requested_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct SchedulerHandle {
     control: watch::Sender<ControlSignal>,
+    manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
     pause_controller: Option<Arc<dyn PauseController>>,
     active_job_ids: Arc<Mutex<HashSet<String>>>,
 }
@@ -65,11 +74,13 @@ pub struct SchedulerHandle {
 impl SchedulerHandle {
     pub(crate) fn new(
         control: watch::Sender<ControlSignal>,
+        manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
         pause_controller: Option<Arc<dyn PauseController>>,
         active_job_ids: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
             control,
+            manual_triggers,
             pause_controller,
             active_job_ids,
         }
@@ -123,6 +134,22 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    pub async fn trigger_now(&self) -> Result<(), SchedulerError> {
+        let Some(job_id) = self.single_active_job_id()? else {
+            return Err(SchedulerError::invalid_job_with_kind(
+                crate::InvalidJobKind::Other,
+                "trigger_now requires exactly one active job",
+            ));
+        };
+        self.manual_triggers.lock().unwrap().insert(job_id, ManualTriggerRequest {
+            requested_at: Utc::now(),
+        });
+        let mut next = *self.control.borrow();
+        next.poke_seq = next.poke_seq.saturating_add(1);
+        let _ = self.control.send(next);
+        Ok(())
+    }
+
     fn send_mode_command(
         &self,
         desired_mode: SchedulerMode,
@@ -148,7 +175,7 @@ impl SchedulerHandle {
             1 => Ok(active_job_ids.iter().next().cloned()),
             _ => Err(SchedulerError::invalid_job_with_kind(
                 crate::InvalidJobKind::Other,
-                "pause/resume requires exactly one active job for coordinated schedulers",
+                "pause/resume/trigger_now requires exactly one active job for coordinated schedulers",
             )),
         }
     }

@@ -7,6 +7,7 @@ use chrono::Utc;
 use refresh_support::RefreshDeps;
 use scheduler::{
     InMemoryStateStore, Job, RunContext, Schedule, Scheduler, SchedulerConfig, Task, TaskContext,
+    TriggerSource, TriggeredTaskContext,
 };
 use std::sync::{
     Arc,
@@ -154,5 +155,27 @@ async fn blocking_task_runs() {
     let report = scheduler.run(job).await.unwrap();
 
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
+}
+
+#[tokio::test]
+async fn scheduled_trigger_source_is_visible_to_trigger_aware_tasks() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+
+    let report = scheduler
+        .run(
+            Job::without_deps(
+                "scheduled-source",
+                Schedule::Interval(Duration::from_millis(20)),
+                Task::from_async_with_trigger(|context: TriggeredTaskContext<()>| async move {
+                    assert_eq!(context.source, TriggerSource::Scheduled);
+                    Ok(())
+                }),
+            )
+            .with_max_runs(1),
+        )
+        .await
+        .unwrap();
+
     assert_eq!(report.history.len(), 1);
 }

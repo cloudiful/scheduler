@@ -14,5 +14,8 @@ pub use schedule::{
 pub(crate) use state::push_history;
 pub use state::{JobState, RunRecord, RunStatus, SchedulerReport};
 pub(crate) use task::TaskHandler;
-pub use task::{Job, JobFuture, JobResult, RunContext, Task, TaskContext};
+pub use task::{
+    Job, JobFuture, JobResult, RunContext, Task, TaskContext, TriggerSource,
+    TriggeredTaskContext,
+};
 pub use time_window::{JobTimeWindow, RunSkipReason, TimeWindowSegment};

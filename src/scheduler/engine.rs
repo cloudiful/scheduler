@@ -1,4 +1,4 @@
-use super::control::{ControlSignal, PauseController, SchedulerHandle};
+use super::control::{ControlSignal, ManualTriggerRequest, PauseController, SchedulerHandle};
 use super::coordinated::run_coordinated_scheduler;
 use super::legacy::run_legacy_scheduler;
 use crate::coordinated_store::{
@@ -10,7 +10,7 @@ use crate::observer::{LogObserver, NoopObserver, SchedulerEvent, SchedulerObserv
 use crate::store::{StateStore, StoreEvent};
 use crate::{ExecutionGuard, InMemoryStateStore, NoopExecutionGuard};
 use chrono::Utc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,6 +43,7 @@ where
     pub(super) backend: SchedulerBackend<S, G, C>,
     pub(super) observer: Arc<dyn SchedulerObserver>,
     pub(super) control: watch::Sender<ControlSignal>,
+    pub(super) manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
     pub(super) active_job_ids: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -93,6 +94,7 @@ where
             },
             observer: Arc::new(observer),
             control,
+            manual_triggers: Arc::new(Mutex::new(HashMap::new())),
             active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -128,6 +130,7 @@ where
             },
             observer: Arc::new(observer),
             control,
+            manual_triggers: Arc::new(Mutex::new(HashMap::new())),
             active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -320,6 +323,7 @@ where
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle::new(
             self.control.clone(),
+            self.manual_triggers.clone(),
             self.pause_controller(),
             self.active_job_ids.clone(),
         )

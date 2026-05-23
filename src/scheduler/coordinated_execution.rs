@@ -41,7 +41,7 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
     let job_id = job.job_id.clone();
     active.spawn(async move {
         let started_at = Utc::now();
-        let run_future = task(crate::TaskContext {
+        let run_future = task(crate::TriggeredTaskContext {
             run: crate::RunContext {
                 job_id,
                 scheduled_at: claim.trigger.scheduled_at,
@@ -49,6 +49,7 @@ pub(super) async fn spawn_coordinated_trigger<S, G, C, D>(
                 timezone,
             },
             deps,
+            source: claim.trigger.source,
         });
         tokio::pin!(run_future);
         let mut renewal_count = 0u32;

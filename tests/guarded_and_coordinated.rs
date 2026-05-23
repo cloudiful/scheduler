@@ -7,10 +7,12 @@ use scheduler::{
     CoordinatedLeaseConfig, CoordinatedPendingTrigger, CoordinatedStateStore, ExecutionGuardScope,
     ExecutionSlot, GuardedRunResult, GuardedRunner, Job, JobState, JobTimeWindow, OverlapPolicy,
     PauseScope, RunSkipReason, Schedule, Scheduler, SchedulerConfig, SchedulerEvent, Task,
+    TriggerSource,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn guarded_runner_resource_scope_blocks_occurrence_scope_for_same_resource() {
@@ -42,6 +44,7 @@ async fn coordinated_store_reclaims_expired_inflight_occurrence() {
         scheduled_at: Utc::now(),
         catch_up: false,
         trigger_count: 1,
+        source: TriggerSource::Scheduled,
     };
     let lease_config = CoordinatedLeaseConfig {
         ttl: Duration::from_millis(20),
@@ -184,6 +187,7 @@ async fn coordinated_store_resource_scope_blocks_parallel_claims() {
                 scheduled_at: first,
                 catch_up: false,
                 trigger_count: 1,
+            source: TriggerSource::Scheduled,
             },
             &state,
             config,
@@ -203,6 +207,7 @@ async fn coordinated_store_resource_scope_blocks_parallel_claims() {
                 scheduled_at: second,
                 catch_up: false,
                 trigger_count: 2,
+            source: TriggerSource::Scheduled,
             },
             &state,
             config,
@@ -377,4 +382,153 @@ async fn coordinated_pause_is_shared_across_instances_and_emits_shared_events() 
     let blocked = blocked_run.await.unwrap();
     assert!(blocked.is_err());
     assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinated_manual_trigger_executes_once_across_instances() {
+    let scheduled_at = Utc::now() + chrono::TimeDelta::seconds(60);
+    let store = FakeCoordinatedStore::new(JobState::new("coord-manual", Some(scheduled_at)));
+    let lease_config = CoordinatedLeaseConfig {
+        ttl: Duration::from_secs(1),
+        renew_interval: Duration::from_millis(50),
+    };
+    let scheduler_one = Arc::new(Scheduler::with_coordinated_state_store(
+        SchedulerConfig::default(),
+        store.clone(),
+        lease_config,
+    ));
+    let scheduler_two = Arc::new(Scheduler::with_coordinated_state_store(
+        SchedulerConfig::default(),
+        store,
+        lease_config,
+    ));
+    let handle = scheduler_one.handle();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    let (ready_one_tx, ready_one_rx) = oneshot::channel();
+    let run_one = {
+        let scheduler = scheduler_one.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let _ = ready_one_tx.send(());
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "coord-manual",
+                        Schedule::AtTimes(vec![scheduled_at.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                        Task::from_async_with_trigger(move |context| {
+                            let seen = seen.clone();
+                            async move {
+                                assert_eq!(context.source, TriggerSource::Manual);
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_overlap_policy(OverlapPolicy::Forbid)
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+    let run_two = {
+        let scheduler = scheduler_two.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "coord-manual",
+                        Schedule::AtTimes(vec![scheduled_at.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                        Task::from_async_with_trigger(move |_context| {
+                            let seen = seen.clone();
+                            async move {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_overlap_policy(OverlapPolicy::Forbid)
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    let _ = ready_one_rx.await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    handle.trigger_now().await.unwrap();
+    for _ in 0..20 {
+        if seen.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    scheduler_one.handle().shutdown();
+    scheduler_two.handle().shutdown();
+    let first = run_one.await.unwrap();
+    let second = run_two.await.unwrap();
+
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(first.history.len() + second.history.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinated_manual_trigger_waits_until_resume() {
+    let scheduled_at = Utc::now() + chrono::TimeDelta::seconds(60);
+    let store = FakeCoordinatedStore::new(JobState::new("coord-manual-paused", Some(scheduled_at)));
+    let lease_config = CoordinatedLeaseConfig {
+        ttl: Duration::from_secs(1),
+        renew_interval: Duration::from_millis(50),
+    };
+    let scheduler = Arc::new(Scheduler::with_coordinated_state_store(
+        SchedulerConfig::default(),
+        store.clone(),
+        lease_config,
+    ));
+    let handle = scheduler.handle();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let run = {
+        let scheduler = scheduler.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "coord-manual-paused",
+                        Schedule::AtTimes(vec![scheduled_at.with_timezone(&chrono_tz::Asia::Shanghai)]),
+                        Task::from_async_with_trigger(move |context| {
+                            let seen = seen.clone();
+                            async move {
+                                assert_eq!(context.source, TriggerSource::Manual);
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_overlap_policy(OverlapPolicy::Forbid)
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    let _ = ready_rx.await;
+    handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    handle.trigger_now().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    assert!(store.is_paused());
+
+    handle.resume().await.unwrap();
+    let report = run.await.unwrap();
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
 }

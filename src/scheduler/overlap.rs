@@ -50,7 +50,7 @@ pub(crate) fn dispatch_trigger(
 #[cfg(test)]
 mod tests {
     use super::{OverlapAction, dispatch_trigger, take_queued_if_idle};
-    use crate::OverlapPolicy;
+    use crate::{OverlapPolicy, TriggerSource};
     use crate::scheduler::trigger::PendingTrigger;
     use chrono::Utc;
 
@@ -59,6 +59,7 @@ mod tests {
             scheduled_at: Utc::now(),
             catch_up: false,
             trigger_count: 1,
+            source: TriggerSource::Scheduled,
         }
     }
 

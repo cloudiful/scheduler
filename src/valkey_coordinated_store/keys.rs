@@ -1,5 +1,6 @@
 use super::ValkeyCoordinatedStateStore;
 use crate::execution_guard::ExecutionGuardScope;
+use crate::model::TriggerSource;
 use crate::valkey_execution_support::{
     occurrence_index_key, occurrence_lease_key, resource_lock_key,
 };
@@ -15,6 +16,7 @@ pub(super) const FIELD_PAUSED: &str = "paused";
 pub(super) const FIELD_INFLIGHT_SCHEDULED_AT: &str = "inflight_scheduled_at";
 pub(super) const FIELD_INFLIGHT_CATCH_UP: &str = "inflight_catch_up";
 pub(super) const FIELD_INFLIGHT_TRIGGER_COUNT: &str = "inflight_trigger_count";
+pub(super) const FIELD_INFLIGHT_SOURCE: &str = "inflight_source";
 pub(super) const FIELD_INFLIGHT_RESOURCE_ID: &str = "inflight_resource_id";
 pub(super) const FIELD_INFLIGHT_SCOPE: &str = "inflight_scope";
 pub(super) const FIELD_INFLIGHT_TOKEN: &str = "inflight_token";
@@ -66,5 +68,19 @@ pub(super) fn scope_to_str(scope: ExecutionGuardScope) -> &'static str {
     match scope {
         ExecutionGuardScope::Occurrence => "occurrence",
         ExecutionGuardScope::Resource => "resource",
+    }
+}
+
+pub(super) fn parse_trigger_source(raw: &str) -> TriggerSource {
+    match raw {
+        "manual" => TriggerSource::Manual,
+        _ => TriggerSource::Scheduled,
+    }
+}
+
+pub(super) fn trigger_source_to_str(source: TriggerSource) -> &'static str {
+    match source {
+        TriggerSource::Scheduled => "scheduled",
+        TriggerSource::Manual => "manual",
     }
 }

@@ -95,8 +95,18 @@ scheduler = { package = "cloudiful-scheduler", git = "https://github.com/cloudif
 - `SchedulerHandle::shutdown()` stops accepting new work and waits for the current run to finish.
 - `SchedulerHandle::pause().await` stops future triggers without interrupting the current run.
 - `SchedulerHandle::resume().await` wakes the scheduler immediately and resumes with the configured missed-run policy.
+- `SchedulerHandle::trigger_now().await` submits one immediate manual trigger through the normal scheduler execution path.
 
 Dependency injection in this crate is explicit: you pass a dependency value at job construction time. The scheduler does not auto-resolve arbitrary function parameters.
+
+Manual trigger notes:
+
+- `trigger_now()` is a submission API, not a synchronous execution API.
+- It does not rewrite the configured schedule or `next_run_at`; it adds one immediate trigger.
+- It uses the existing overlap policy, queueing behavior, execution guard, observer, store, and coordinated claim/complete path.
+- If the scheduler is paused, the manual trigger is accepted and runs after `resume()`.
+- `SchedulerHandle` still assumes one logical active job per scheduler instance; `trigger_now()` requires exactly one active job on that handle.
+- Tasks that need to distinguish scheduled vs manual execution can use `Task::from_*_with_trigger(...)` and inspect `TriggeredTaskContext::source`.
 
 ## Example: async task without dependencies
 

@@ -2,9 +2,9 @@ use super::control::{CommandDisposition, SchedulerMode, StopSignal};
 use super::overlap::{OverlapAction, dispatch_trigger, take_queued_if_idle};
 use super::trigger::{PendingTrigger, TriggerDecision, next_trigger};
 use crate::error::SchedulerError;
-use crate::model::{Job, JobState, RunRecord, SchedulerReport};
+use crate::model::{Job, JobState, RunRecord, SchedulerReport, TriggerSource};
 use crate::observer::{PauseScope, SchedulerEvent, SchedulerStopReason};
-use crate::scheduler::trigger_math::next_run_is_in_future;
+use crate::scheduler::trigger_math::{advance_state_for_manual_trigger, next_run_is_in_future};
 use chrono::Utc;
 use std::collections::VecDeque;
 use tokio::task::JoinSet;
@@ -203,6 +203,60 @@ where
                 continue;
             }
 
+            let pending_manual_request = scheduler
+                .manual_triggers
+                .lock()
+                .unwrap()
+                .remove(&job.job_id);
+            if let Some(request) = pending_manual_request {
+                let mut candidate_state = backend.state(&runtime).clone();
+                let trigger = PendingTrigger {
+                    scheduled_at: request.requested_at,
+                    catch_up: false,
+                    trigger_count: advance_state_for_manual_trigger(&job, &mut candidate_state),
+                    source: TriggerSource::Manual,
+                };
+
+                match dispatch_trigger(
+                    job.overlap_policy,
+                    active_count,
+                    &mut queued_trigger,
+                    trigger,
+                ) {
+                    OverlapAction::Spawn(trigger) => {
+                        if backend
+                            .handle_due_trigger(
+                                scheduler,
+                                &job,
+                                &mut runtime,
+                                candidate_state,
+                                trigger,
+                                OverlapAction::Spawn(trigger),
+                                &mut active,
+                            )
+                            .await?
+                        {
+                            active_count += 1;
+                        }
+                        continue;
+                    }
+                    OverlapAction::QueueUpdated | OverlapAction::Dropped => {
+                        let _ = backend
+                            .handle_due_trigger(
+                                scheduler,
+                                &job,
+                                &mut runtime,
+                                candidate_state,
+                                trigger,
+                                OverlapAction::QueueUpdated,
+                                &mut active,
+                            )
+                            .await?;
+                        continue;
+                    }
+                }
+            }
+
             let now = Utc::now();
             if !scheduler.should_wait_for_active_replay(&job, active_count) {
                 let mut candidate_state = backend.state(&runtime).clone();
@@ -283,6 +337,7 @@ where
             && next_run_at.is_none()
             && active_count == 0
             && queued_trigger.is_none()
+            && !scheduler.manual_triggers.lock().unwrap().contains_key(&job.job_id)
         {
             if matches!(
                 scheduler.config.terminal_state_policy,
@@ -327,7 +382,7 @@ where
                     break;
                 }
             }
-            _ = scheduler.sleep_until_next(next_run_at), if control_rx.borrow().stop_signal.is_none() && matches!(control_rx.borrow().desired_mode, SchedulerMode::Running) && !backend.is_paused(&runtime) && queued_trigger.is_none() && next_run_is_in_future(next_run_at) => {}
+            _ = scheduler.sleep_until_next(next_run_at), if control_rx.borrow().stop_signal.is_none() && matches!(control_rx.borrow().desired_mode, SchedulerMode::Running) && !backend.is_paused(&runtime) && queued_trigger.is_none() && !scheduler.manual_triggers.lock().unwrap().contains_key(&job.job_id) && next_run_is_in_future(next_run_at) => {}
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if backend.is_paused(&runtime) => {}
         }
     }

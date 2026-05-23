@@ -11,7 +11,7 @@ use chrono::Utc;
 use scheduler::{
     CoordinatedClaim, CoordinatedCompletion, CoordinatedLeaseConfig, CoordinatedPendingTrigger,
     CoordinatedRuntimeState, CoordinatedStateStore, ExecutionGuardRenewal, ExecutionGuardScope,
-    JobState, ValkeyCoordinatedStateStore,
+    JobState, TriggerSource, ValkeyCoordinatedStateStore,
 };
 use std::time::Duration;
 use valkey_cleanup::delete_matching_prefix;
@@ -130,6 +130,7 @@ async fn claim_with_scope(
                 scheduled_at,
                 catch_up: false,
                 trigger_count,
+                source: TriggerSource::Scheduled,
             },
             state,
             config,
@@ -189,6 +190,7 @@ async fn claim_trigger_script_claims_occurrence_in_valkey() {
         scheduled_at: Utc::now(),
         catch_up: false,
         trigger_count: 1,
+            source: TriggerSource::Scheduled,
     };
 
     let runtime = load_runtime(&store, &job_id, initial.clone()).await;
@@ -280,6 +282,7 @@ async fn claim_trigger_script_resource_scope_blocks_other_claims() {
                 scheduled_at: second,
                 catch_up: false,
                 trigger_count: 2,
+            source: TriggerSource::Scheduled,
             },
             &state,
             lease_config(),
@@ -302,6 +305,7 @@ async fn reclaim_inflight_script_reclaims_expired_occurrence_from_valkey() {
         scheduled_at: Utc::now(),
         catch_up: false,
         trigger_count: 1,
+            source: TriggerSource::Scheduled,
     };
     let config = CoordinatedLeaseConfig {
         ttl: Duration::from_millis(20),
@@ -345,6 +349,7 @@ async fn renew_lease_script_extends_live_occurrence_lease() {
         scheduled_at: Utc::now(),
         catch_up: false,
         trigger_count: 1,
+            source: TriggerSource::Scheduled,
     };
     let config = lease_config();
 
@@ -380,6 +385,7 @@ async fn complete_script_applies_completion_patch_and_clears_inflight() {
         scheduled_at: Utc::now(),
         catch_up: false,
         trigger_count: 1,
+            source: TriggerSource::Scheduled,
     };
     let config = lease_config();
 

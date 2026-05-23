@@ -1,6 +1,6 @@
 use crate::error::{ExecutionGuardErrorKind, StoreErrorKind};
 use crate::execution_guard::{ExecutionGuardRenewal, ExecutionGuardScope, ExecutionLease};
-use crate::model::JobState;
+use crate::model::{JobState, TriggerSource};
 use chrono::{DateTime, Utc};
 use std::convert::Infallible;
 use std::future::Future;
@@ -40,6 +40,7 @@ pub struct CoordinatedPendingTrigger {
     pub scheduled_at: DateTime<Utc>,
     pub catch_up: bool,
     pub trigger_count: u32,
+    pub source: TriggerSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub type JobResult = Result<(), String>;
 /// The boxed future returned by a scheduled job.
 pub type JobFuture = Pin<Box<dyn Future<Output = JobResult> + Send>>;
-pub(crate) type TaskHandler<D> = Arc<dyn Fn(TaskContext<D>) -> JobFuture + Send + Sync>;
+pub(crate) type TaskHandler<D> = Arc<dyn Fn(TriggeredTaskContext<D>) -> JobFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Task<D> {
@@ -35,7 +35,12 @@ where
         F: Fn(TaskContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = JobResult> + Send + 'static,
     {
-        Self::from_handler(wrap_async_handler(Arc::new(task)))
+        Self::from_handler(wrap_async_handler(Arc::new(move |context: TriggeredTaskContext<D>| {
+            task(TaskContext {
+                run: context.run,
+                deps: context.deps,
+            })
+        })))
     }
 
     /// Create a lightweight synchronous task from the full [`TaskContext`].
@@ -43,13 +48,48 @@ where
     where
         F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
     {
-        Self::from_handler(wrap_sync_handler(Arc::new(task)))
+        Self::from_handler(wrap_sync_handler(Arc::new(move |context: TriggeredTaskContext<D>| {
+            task(TaskContext {
+                run: context.run,
+                deps: context.deps,
+            })
+        })))
     }
 
     /// Create a blocking synchronous task from the full [`TaskContext`].
     pub fn from_blocking<F>(task: F) -> Self
     where
         F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
+    {
+        Self::from_handler(wrap_blocking_handler(Arc::new(move |context: TriggeredTaskContext<D>| {
+            task(TaskContext {
+                run: context.run,
+                deps: context.deps,
+            })
+        })))
+    }
+
+    /// Create an async task from the full [`TriggeredTaskContext`].
+    pub fn from_async_with_trigger<F, Fut>(task: F) -> Self
+    where
+        F: Fn(TriggeredTaskContext<D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+    {
+        Self::from_handler(wrap_async_handler(Arc::new(task)))
+    }
+
+    /// Create a lightweight synchronous task from the full [`TriggeredTaskContext`].
+    pub fn from_sync_with_trigger<F>(task: F) -> Self
+    where
+        F: Fn(TriggeredTaskContext<D>) -> JobResult + Send + Sync + 'static,
+    {
+        Self::from_handler(wrap_sync_handler(Arc::new(task)))
+    }
+
+    /// Create a blocking synchronous task from the full [`TriggeredTaskContext`].
+    pub fn from_blocking_with_trigger<F>(task: F) -> Self
+    where
+        F: Fn(TriggeredTaskContext<D>) -> JobResult + Send + Sync + 'static,
     {
         Self::from_handler(wrap_blocking_handler(Arc::new(task)))
     }
@@ -189,7 +229,7 @@ impl<D> std::fmt::Debug for Job<D> {
 fn wrap_async_handler<D, F, Fut>(task: Arc<F>) -> TaskHandler<D>
 where
     D: Send + Sync + 'static,
-    F: Fn(TaskContext<D>) -> Fut + Send + Sync + 'static,
+    F: Fn(TriggeredTaskContext<D>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = JobResult> + Send + 'static,
 {
     Arc::new(move |context| Box::pin((*task)(context)))
@@ -198,7 +238,7 @@ where
 fn wrap_sync_handler<D, F>(task: Arc<F>) -> TaskHandler<D>
 where
     D: Send + Sync + 'static,
-    F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
+    F: Fn(TriggeredTaskContext<D>) -> JobResult + Send + Sync + 'static,
 {
     Arc::new(move |context| Box::pin(ready((*task)(context))))
 }
@@ -206,7 +246,7 @@ where
 fn wrap_blocking_handler<D, F>(task: Arc<F>) -> TaskHandler<D>
 where
     D: Send + Sync + 'static,
-    F: Fn(TaskContext<D>) -> JobResult + Send + Sync + 'static,
+    F: Fn(TriggeredTaskContext<D>) -> JobResult + Send + Sync + 'static,
 {
     Arc::new(move |context| {
         let task = task.clone();
@@ -223,6 +263,12 @@ pub struct RunContext {
     pub timezone: Tz,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerSource {
+    Scheduled,
+    Manual,
+}
+
 #[derive(Clone)]
 pub struct TaskContext<D> {
     pub run: RunContext,
@@ -234,6 +280,23 @@ impl<D> std::fmt::Debug for TaskContext<D> {
         f.debug_struct("TaskContext")
             .field("run", &self.run)
             .field("deps", &type_name::<D>())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct TriggeredTaskContext<D> {
+    pub run: RunContext,
+    pub deps: Arc<D>,
+    pub source: TriggerSource,
+}
+
+impl<D> std::fmt::Debug for TriggeredTaskContext<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TriggeredTaskContext")
+            .field("run", &self.run)
+            .field("deps", &type_name::<D>())
+            .field("source", &self.source)
             .finish()
     }
 }

@@ -10,8 +10,9 @@ local next_state_payload = ARGV[9]
 local scheduled_at = ARGV[10]
 local catch_up = ARGV[11]
 local trigger_count = ARGV[12]
-local resource_id = ARGV[13]
-local scope = ARGV[14]
+local source = ARGV[13]
+local resource_id = ARGV[14]
+local scope = ARGV[15]
 
 local version = tonumber(redis.call('HGET', KEYS[1], field_version) or '-1')
 local paused = redis.call('HGET', KEYS[1], field_paused)
@@ -42,6 +43,7 @@ redis.call('HSET', KEYS[1],
     field_prefix .. 'scheduled_at', scheduled_at,
     field_prefix .. 'catch_up', catch_up,
     field_prefix .. 'trigger_count', trigger_count,
+    field_prefix .. 'source', source,
     field_prefix .. 'resource_id', resource_id,
     field_prefix .. 'scope', scope,
     field_prefix .. 'token', token,

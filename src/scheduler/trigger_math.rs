@@ -132,6 +132,16 @@ where
     Ok(())
 }
 
+pub(crate) fn advance_state_for_manual_trigger<D>(job: &Job<D>, state: &mut JobState) -> u32 {
+    state.trigger_count += 1;
+    if let Some(max_runs) = job.max_runs
+        && state.trigger_count >= max_runs
+    {
+        state.next_run_at = None;
+    }
+    state.trigger_count
+}
+
 pub(crate) fn compute_next_after<D>(
     job: &Job<D>,
     scheduled_at: DateTime<Utc>,

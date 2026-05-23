@@ -1,5 +1,5 @@
 use crate::error::SchedulerError;
-use crate::model::{Job, JobState};
+use crate::model::{Job, JobState, TriggerSource};
 use crate::scheduler::trigger_math::{
     advance_state_to, consume_due_summary, inspect_due_window, is_missed,
 };
@@ -11,6 +11,7 @@ pub(crate) struct PendingTrigger {
     pub(crate) scheduled_at: DateTime<Utc>,
     pub(crate) catch_up: bool,
     pub(crate) trigger_count: u32,
+    pub(crate) source: TriggerSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ where
                     scheduled_at: summary.first_due,
                     catch_up: false,
                     trigger_count: state.trigger_count,
+                    source: TriggerSource::Scheduled,
                 }));
             }
 
@@ -68,6 +70,7 @@ where
                 scheduled_at,
                 catch_up: summary.count > 1 || is_missed(scheduled_at, now),
                 trigger_count: state.trigger_count,
+                source: TriggerSource::Scheduled,
             }))
         }
         crate::MissedRunPolicy::ReplayAll => {
@@ -81,6 +84,7 @@ where
                 scheduled_at: first_due,
                 catch_up: window.has_multiple || is_missed(first_due, now),
                 trigger_count: state.trigger_count,
+                source: TriggerSource::Scheduled,
             }))
         }
     }
@@ -93,7 +97,7 @@ mod tests {
         advance_state_for, collect_due_times, compute_next_after, consume_due_summary,
         inspect_due_window,
     };
-    use crate::{CronSchedule, Job, JobState, MissedRunPolicy, Schedule, Task};
+    use crate::{CronSchedule, Job, JobState, MissedRunPolicy, Schedule, Task, TriggerSource};
     use chrono::{TimeDelta, TimeZone, Utc};
     use chrono_tz::Asia::Shanghai;
     use std::time::Duration;
@@ -176,6 +180,7 @@ mod tests {
                 scheduled_at: first.with_timezone(&Utc),
                 catch_up: true,
                 trigger_count: 1,
+                source: TriggerSource::Scheduled,
             })
         );
         assert_eq!(state.trigger_count, 1);

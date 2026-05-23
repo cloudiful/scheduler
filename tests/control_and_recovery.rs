@@ -5,7 +5,7 @@ use chrono::{TimeDelta, Utc};
 use chrono_tz::UTC;
 use scheduler::{
     InMemoryStateStore, Job, JobState, PauseScope, Schedule, Scheduler, SchedulerConfig,
-    SchedulerEvent, SchedulerObserver, StateStore, Task,
+    SchedulerEvent, SchedulerObserver, StateStore, Task, TriggerSource, TriggeredTaskContext,
 };
 use std::sync::{
     Arc, Mutex,
@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::Duration;
 use time_support::shanghai_after;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 #[derive(Clone, Default)]
 struct RecordingObserver {
@@ -508,4 +509,177 @@ async fn pause_does_not_interrupt_running_task() {
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(report.history.len(), 1);
     assert_eq!(report.state.trigger_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_trigger_runs_immediately_when_idle() {
+    let scheduler = Arc::new(Scheduler::new(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+    ));
+    let handle = scheduler.handle();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = {
+        let scheduler = scheduler.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "manual-idle",
+                        Schedule::Interval(Duration::from_secs(60)),
+                        Task::from_async_with_trigger(move |context: TriggeredTaskContext<()>| {
+                            let seen = seen.clone();
+                            async move {
+                                assert_eq!(context.source, TriggerSource::Manual);
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    let _ = ready_rx.await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    handle.trigger_now().await.unwrap();
+    let report = task.await.unwrap();
+
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
+    assert_eq!(report.state.trigger_count, 1);
+    assert!(report.state.next_run_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_trigger_paused_until_resume() {
+    let scheduler = Arc::new(Scheduler::new(
+        SchedulerConfig::default(),
+        InMemoryStateStore::new(),
+    ));
+    let handle = scheduler.handle();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let scheduled_at = shanghai_after(60_000);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = {
+        let scheduler = scheduler.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            scheduler
+                .run(
+                    Job::without_deps(
+                        "manual-paused",
+                        Schedule::AtTimes(vec![scheduled_at]),
+                        Task::from_async_with_trigger(move |context: TriggeredTaskContext<()>| {
+                            let seen = seen.clone();
+                            async move {
+                                assert_eq!(context.source, TriggerSource::Manual);
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }),
+                    )
+                    .with_max_runs(1),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    let _ = ready_rx.await;
+    handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    handle.trigger_now().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+
+    handle.resume().await.unwrap();
+    let report = task.await.unwrap();
+
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(report.history.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_trigger_respects_overlap_policies_while_running() {
+    for policy in [
+        scheduler::OverlapPolicy::Forbid,
+        scheduler::OverlapPolicy::QueueOne,
+        scheduler::OverlapPolicy::AllowParallel,
+    ] {
+        let scheduler = Arc::new(Scheduler::new(
+            SchedulerConfig::default(),
+            InMemoryStateStore::new(),
+        ));
+        let handle = scheduler.handle();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = {
+            let scheduler = scheduler.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tokio::spawn(async move {
+                let _ = ready_tx.send(());
+                scheduler
+                    .run(
+                        Job::without_deps(
+                            "manual-overlap",
+                            Schedule::Interval(Duration::from_secs(60)),
+                            Task::from_async_with_trigger(move |context: TriggeredTaskContext<()>| {
+                                let active = active.clone();
+                                let max_active = max_active.clone();
+                                async move {
+                                    assert_eq!(context.source, TriggerSource::Manual);
+                                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    max_active.fetch_max(current, Ordering::SeqCst);
+                                    tokio::time::sleep(Duration::from_millis(60)).await;
+                                    active.fetch_sub(1, Ordering::SeqCst);
+                                    Ok(())
+                                }
+                            }),
+                        )
+                        .with_overlap_policy(policy)
+                        .with_max_runs(match policy {
+                            scheduler::OverlapPolicy::Forbid => 1,
+                            _ => 2,
+                        }),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let _ = ready_rx.await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.trigger_now().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.trigger_now().await.unwrap();
+        let report = task.await.unwrap();
+
+        match policy {
+            scheduler::OverlapPolicy::Forbid => {
+                assert_eq!(report.history.len(), 1);
+                assert_eq!(max_active.load(Ordering::SeqCst), 1);
+            }
+            scheduler::OverlapPolicy::QueueOne => {
+                assert_eq!(report.history.len(), 2);
+                assert_eq!(max_active.load(Ordering::SeqCst), 1);
+            }
+            scheduler::OverlapPolicy::AllowParallel => {
+                assert_eq!(report.history.len(), 2);
+                assert!(max_active.load(Ordering::SeqCst) >= 2);
+            }
+        }
+    }
 }
