@@ -598,6 +598,17 @@ async fn manual_trigger_paused_until_resume() {
     };
 
     let _ = ready_rx.await;
+    for _ in 0..50 {
+        if observer.snapshot().iter().any(|event| {
+            matches!(
+                event,
+                SchedulerEvent::StateLoaded { job_id, .. } if job_id == "manual-paused"
+            )
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     handle.pause().await.unwrap();
     for _ in 0..50 {
         if observer.snapshot().iter().any(|event| {
