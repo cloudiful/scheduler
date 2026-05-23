@@ -44,6 +44,7 @@ where
     pub(super) observer: Arc<dyn SchedulerObserver>,
     pub(super) control: watch::Sender<ControlSignal>,
     pub(super) manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
+    pub(super) applied_modes: Arc<Mutex<HashMap<String, super::control::SchedulerMode>>>,
     pub(super) active_job_ids: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -95,6 +96,7 @@ where
             observer: Arc::new(observer),
             control,
             manual_triggers: Arc::new(Mutex::new(HashMap::new())),
+            applied_modes: Arc::new(Mutex::new(HashMap::new())),
             active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -131,6 +133,7 @@ where
             observer: Arc::new(observer),
             control,
             manual_triggers: Arc::new(Mutex::new(HashMap::new())),
+            applied_modes: Arc::new(Mutex::new(HashMap::new())),
             active_job_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -324,6 +327,7 @@ where
         SchedulerHandle::new(
             self.control.clone(),
             self.manual_triggers.clone(),
+            self.applied_modes.clone(),
             self.pause_controller(),
             self.active_job_ids.clone(),
         )
@@ -336,6 +340,10 @@ where
         let job = self.normalize_job(job)?;
         let job_id = job.job_id.clone();
         self.active_job_ids.lock().unwrap().insert(job_id.clone());
+        self.applied_modes
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), super::control::SchedulerMode::Running);
         let result = match &self.backend {
             SchedulerBackend::Legacy { store, guard } => {
                 run_legacy_scheduler(self, job, store, guard).await
@@ -346,6 +354,7 @@ where
             } => run_coordinated_scheduler(self, job, store, *lease_config).await,
         };
         self.active_job_ids.lock().unwrap().remove(&job_id);
+        self.applied_modes.lock().unwrap().remove(&job_id);
         result
     }
 }

@@ -560,9 +560,11 @@ async fn manual_trigger_runs_immediately_when_idle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_trigger_paused_until_resume() {
-    let scheduler = Arc::new(Scheduler::new(
+    let observer = RecordingObserver::default();
+    let scheduler = Arc::new(Scheduler::with_observer(
         SchedulerConfig::default(),
         InMemoryStateStore::new(),
+        observer.clone(),
     ));
     let handle = scheduler.handle();
     let seen = Arc::new(AtomicUsize::new(0));
@@ -597,7 +599,18 @@ async fn manual_trigger_paused_until_resume() {
 
     let _ = ready_rx.await;
     handle.pause().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    for _ in 0..50 {
+        if observer.snapshot().iter().any(|event| {
+            matches!(
+                event,
+                SchedulerEvent::SchedulerPaused { job_id, scope, .. }
+                    if job_id == "manual-paused" && *scope == PauseScope::Local
+            )
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     handle.trigger_now().await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(seen.load(Ordering::SeqCst), 0);

@@ -154,6 +154,11 @@ where
                 },
                 CommandDisposition::ObserveOnly { changed } => changed,
             };
+            scheduler
+                .applied_modes
+                .lock()
+                .unwrap()
+                .insert(job.job_id.clone(), control.desired_mode);
             last_seen_mode_command = control.mode_command_seq;
             if changed {
                 match control.desired_mode {

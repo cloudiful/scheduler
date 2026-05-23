@@ -67,6 +67,7 @@ pub(crate) struct ManualTriggerRequest {
 pub struct SchedulerHandle {
     control: watch::Sender<ControlSignal>,
     manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
+    applied_modes: Arc<Mutex<HashMap<String, SchedulerMode>>>,
     pause_controller: Option<Arc<dyn PauseController>>,
     active_job_ids: Arc<Mutex<HashSet<String>>>,
 }
@@ -75,12 +76,14 @@ impl SchedulerHandle {
     pub(crate) fn new(
         control: watch::Sender<ControlSignal>,
         manual_triggers: Arc<Mutex<HashMap<String, ManualTriggerRequest>>>,
+        applied_modes: Arc<Mutex<HashMap<String, SchedulerMode>>>,
         pause_controller: Option<Arc<dyn PauseController>>,
         active_job_ids: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
             control,
             manual_triggers,
+            applied_modes,
             pause_controller,
             active_job_ids,
         }
@@ -95,8 +98,9 @@ impl SchedulerHandle {
     }
 
     pub async fn pause(&self) -> Result<(), SchedulerError> {
+        let active_job = self.wait_for_single_active_job_id().await?;
         if let Some(controller) = &self.pause_controller {
-            match self.single_active_job_id()? {
+            match active_job.clone() {
                 Some(job_id) => {
                     let changed = controller.pause(&job_id).await?;
                     self.send_mode_command(
@@ -111,12 +115,16 @@ impl SchedulerHandle {
         } else {
             self.send_mode_command(SchedulerMode::Paused, CommandDisposition::Apply);
         }
+        if let Some(job_id) = active_job {
+            self.wait_for_mode(&job_id, SchedulerMode::Paused).await;
+        }
         Ok(())
     }
 
     pub async fn resume(&self) -> Result<(), SchedulerError> {
+        let active_job = self.wait_for_single_active_job_id().await?;
         if let Some(controller) = &self.pause_controller {
-            match self.single_active_job_id()? {
+            match active_job.clone() {
                 Some(job_id) => {
                     let changed = controller.resume(&job_id).await?;
                     self.send_mode_command(
@@ -130,6 +138,9 @@ impl SchedulerHandle {
             }
         } else {
             self.send_mode_command(SchedulerMode::Running, CommandDisposition::Apply);
+        }
+        if let Some(job_id) = active_job {
+            self.wait_for_mode(&job_id, SchedulerMode::Running).await;
         }
         Ok(())
     }
@@ -178,5 +189,31 @@ impl SchedulerHandle {
                 "pause/resume/trigger_now requires exactly one active job for coordinated schedulers",
             )),
         }
+    }
+
+    async fn wait_for_mode(&self, job_id: &str, expected_mode: SchedulerMode) {
+        for _ in 0..100 {
+            if self
+                .applied_modes
+                .lock()
+                .unwrap()
+                .get(job_id)
+                .copied()
+                == Some(expected_mode)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn wait_for_single_active_job_id(&self) -> Result<Option<String>, SchedulerError> {
+        for _ in 0..20 {
+            match self.single_active_job_id()? {
+                Some(job_id) => return Ok(Some(job_id)),
+                None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+        self.single_active_job_id()
     }
 }
