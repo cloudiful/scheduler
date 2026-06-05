@@ -3,6 +3,7 @@ mod coordinated;
 mod coordinated_execution;
 mod engine;
 mod execution;
+mod grouped_cron;
 mod interval_phase;
 mod legacy;
 mod overlap;

@@ -7,9 +7,9 @@ mod time_window;
 pub use cron_schedule::CronSchedule;
 pub(crate) use schedule::utc_time;
 pub use schedule::{
-    GroupedIntervalSchedule, IntervalWindow, MissedRunPolicy, OverlapPolicy, Schedule,
-    SchedulerConfig, StaggeredIntervalSchedule, TerminalStatePolicy, TimeWindowAlignment,
-    WindowedIntervalSchedule,
+    GroupedCronSchedule, GroupedIntervalSchedule, IntervalWindow, MissedRunPolicy,
+    OverlapPolicy, Schedule, SchedulerConfig, StaggeredIntervalSchedule, TerminalStatePolicy,
+    TimeWindowAlignment, WindowedIntervalSchedule,
 };
 pub(crate) use state::push_history;
 pub use state::{JobState, RunRecord, RunStatus, SchedulerReport};

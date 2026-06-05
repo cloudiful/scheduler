@@ -11,7 +11,7 @@ Links:
 
 Version `0.4.5` exposes:
 
-- explicit schedules via `Schedule::Interval`, `Schedule::StaggeredInterval`, `Schedule::GroupedInterval`, `Schedule::AtTimes`, or `Schedule::Cron`
+- explicit schedules via `Schedule::Interval`, `Schedule::StaggeredInterval`, `Schedule::GroupedInterval`, `Schedule::GroupedCron`, `Schedule::AtTimes`, or `Schedule::Cron`
 - windowed interval schedules via `Schedule::WindowedInterval` for different frequencies across local time windows
 - job-level execution windows via `JobTimeWindow`
 - missed-run handling via `MissedRunPolicy`
@@ -220,6 +220,43 @@ async fn main() {
 
     let report = scheduler.run(job).await.unwrap();
     println!("history length: {}", report.history.len());
+}
+```
+
+## Example: grouped cron schedule
+
+Use `GroupedCronSchedule` when many workers share the same cron preset but
+should spread inside a bounded post-anchor window instead of all firing on the
+exact cron minute.
+
+```rust
+use std::time::Duration;
+
+use scheduler::{CronSchedule, InMemoryStateStore, Job, Schedule, Scheduler, SchedulerConfig, Task};
+
+#[tokio::main]
+async fn main() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+    let cron = CronSchedule::parse("0 * * * *").unwrap();
+
+    let job = Job::without_deps(
+        "hourly-refresh-worker-2",
+        Schedule::grouped_cron_with_seed(
+            cron,
+            Duration::from_secs(20 * 60),
+            4,
+            2,
+            "refresh-cluster-a",
+        ),
+        Task::from_async(|_| async move {
+            // Worker 2 runs in its stable slot inside the 20-minute spread.
+            Ok(())
+        }),
+    )
+    .with_max_runs(1);
+
+    let report = scheduler.run(job).await.unwrap();
+    println!("next run: {:?}", report.state.next_run_at);
 }
 ```
 
@@ -521,6 +558,7 @@ In Gitea Actions, set the `SCHEDULER_VALKEY_URL` secret to enable the external V
 - `Schedule::Interval` schedules the first run at `now + interval`.
 - `Schedule::StaggeredInterval` uses a stable phase derived from the job id or an explicit seed, then repeats by the base interval.
 - `Schedule::GroupedInterval` spreads a fixed-size group evenly across the interval, then repeats by the base interval.
+- `Schedule::GroupedCron` treats each cron match as an anchor and spreads a fixed-size group evenly inside a stable `spread` window after that anchor.
 - `Schedule::Cron` evaluates a standard 5-field expression in `SchedulerConfig::timezone`.
 - `max_runs` applies to interval schedules, staggered/grouped interval schedules, explicit `AtTimes` schedules, and cron schedules.
 - `with_max_runs(0)` exits immediately without running any task.

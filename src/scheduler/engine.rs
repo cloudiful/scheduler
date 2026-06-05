@@ -172,6 +172,7 @@ where
             crate::Schedule::Interval(_)
                 | crate::Schedule::StaggeredInterval(_)
                 | crate::Schedule::GroupedInterval(_)
+                | crate::Schedule::GroupedCron(_)
                 | crate::Schedule::WindowedInterval(_)
         ) {
             return false;
@@ -312,6 +313,13 @@ where
                     return Err(SchedulerError::invalid_zero_interval());
                 }
                 crate::scheduler::interval_phase::validate_grouped_interval(grouped)?;
+            }
+            crate::Schedule::GroupedCron(grouped) => {
+                crate::scheduler::grouped_cron::validate(
+                    grouped,
+                    self.config.timezone,
+                    chrono::Utc::now(),
+                )?;
             }
             crate::Schedule::WindowedInterval(windowed) => {
                 crate::scheduler::windowed_interval::validate(windowed)?;

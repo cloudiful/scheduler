@@ -2,8 +2,8 @@
 mod time_support;
 
 use scheduler::{
-    InMemoryStateStore, InvalidJobKind, Job, Schedule, Scheduler, SchedulerConfig, SchedulerError,
-    Task, TaskJoinErrorKind,
+    CronSchedule, InMemoryStateStore, InvalidJobKind, Job, Schedule, Scheduler, SchedulerConfig,
+    SchedulerError, Task, TaskJoinErrorKind,
 };
 use std::sync::{
     Arc,
@@ -266,6 +266,69 @@ async fn invalid_grouped_interval_parameters_have_specific_error_kind() {
     ));
     assert!(matches!(
         out_of_range_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+}
+
+#[tokio::test]
+async fn invalid_grouped_cron_parameters_have_specific_error_kind() {
+    let scheduler = Scheduler::new(SchedulerConfig::default(), InMemoryStateStore::new());
+    let cron = CronSchedule::parse("* * * * *").unwrap();
+
+    let zero_spread_error = scheduler
+        .run(Job::without_deps(
+            "zero-grouped-cron-spread",
+            Schedule::grouped_cron(cron.clone(), Duration::ZERO, 1, 0),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    let zero_group_error = scheduler
+        .run(Job::without_deps(
+            "zero-grouped-cron-group",
+            Schedule::grouped_cron(cron.clone(), Duration::from_secs(20), 0, 0),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    let out_of_range_error = scheduler
+        .run(Job::without_deps(
+            "out-of-range-grouped-cron-member",
+            Schedule::grouped_cron(cron.clone(), Duration::from_secs(20), 3, 3),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    let too_wide_error = scheduler
+        .run(Job::without_deps(
+            "too-wide-grouped-cron-spread",
+            Schedule::grouped_cron(cron, Duration::from_secs(60), 3, 0),
+            Task::from_async(|_| async { Ok(()) }),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        zero_spread_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+    assert!(matches!(
+        zero_group_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+    assert!(matches!(
+        out_of_range_error,
+        SchedulerError::InvalidJob(ref invalid)
+            if invalid.kind() == InvalidJobKind::Other
+    ));
+    assert!(matches!(
+        too_wide_error,
         SchedulerError::InvalidJob(ref invalid)
             if invalid.kind() == InvalidJobKind::Other
     ));

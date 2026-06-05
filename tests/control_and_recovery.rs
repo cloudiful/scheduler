@@ -4,8 +4,9 @@ mod time_support;
 use chrono::{TimeDelta, Utc};
 use chrono_tz::UTC;
 use scheduler::{
-    InMemoryStateStore, Job, JobState, PauseScope, Schedule, Scheduler, SchedulerConfig,
-    SchedulerEvent, SchedulerObserver, StateStore, Task, TriggerSource, TriggeredTaskContext,
+    CronSchedule, InMemoryStateStore, Job, JobState, PauseScope, Schedule, Scheduler,
+    SchedulerConfig, SchedulerEvent, SchedulerObserver, StateStore, Task, TriggerSource,
+    TriggeredTaskContext,
 };
 use std::sync::{
     Arc, Mutex,
@@ -237,6 +238,87 @@ async fn interval_state_with_missing_next_run_at_is_repaired_and_runs_again() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let repaired_state = store.load("repair-interval-state").await.unwrap().unwrap();
+    assert_eq!(repaired_state.trigger_count, 3);
+    assert_eq!(repaired_state.last_run_at, Some(original_last_run_at));
+    assert_eq!(
+        repaired_state.last_success_at,
+        Some(original_last_success_at)
+    );
+    assert_eq!(repaired_state.last_error, original_last_error);
+    assert!(repaired_state.next_run_at.is_some());
+
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = rx.recv().await;
+        shutdown_handle.shutdown();
+    });
+
+    let report = task.await.unwrap();
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(report.state.trigger_count, 4);
+    assert_eq!(report.history.len(), 1);
+    assert!(report.state.next_run_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grouped_cron_state_with_missing_next_run_at_is_repaired_and_runs_again() {
+    let store = Arc::new(InMemoryStateStore::new());
+    let original_last_run_at = Utc::now() - TimeDelta::seconds(10);
+    let original_last_success_at = Utc::now() - TimeDelta::seconds(9);
+    let original_last_error = Some("previous failure".to_string());
+    store
+        .save(&JobState {
+            job_id: "repair-grouped-cron-state".to_string(),
+            trigger_count: 3,
+            last_run_at: Some(original_last_run_at),
+            last_success_at: Some(original_last_success_at),
+            next_run_at: None,
+            last_error: original_last_error.clone(),
+        })
+        .await
+        .unwrap();
+
+    let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default(), store.clone()));
+    let handle = scheduler.handle();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let seen = invocations.clone();
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+
+    let task = {
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(Job::without_deps(
+                    "repair-grouped-cron-state",
+                    Schedule::grouped_cron(
+                        CronSchedule::parse("* * * * *").unwrap(),
+                        Duration::from_secs(40),
+                        4,
+                        2,
+                    ),
+                    Task::from_async(move |_| {
+                        let tx = tx.clone();
+                        let seen = seen.clone();
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            let _ = tx.send(()).await;
+                            Ok(())
+                        }
+                    }),
+                ))
+                .await
+                .unwrap()
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let repaired_state = store
+        .load("repair-grouped-cron-state")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(repaired_state.trigger_count, 3);
     assert_eq!(repaired_state.last_run_at, Some(original_last_run_at));
     assert_eq!(

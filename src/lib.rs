@@ -13,6 +13,8 @@
 //!   derived from the job id or an explicit seed.
 //! - [`Schedule::GroupedInterval`] spreads known group members evenly across
 //!   each interval.
+//! - [`Schedule::GroupedCron`] spreads known group members evenly inside a
+//!   stable post-cron window for each cron anchor.
 //! - [`Schedule::WindowedInterval`] selects an interval by local time windows;
 //!   `None` intervals disable triggers for the matching period.
 //! - [`Schedule::Cron`] evaluates a standard 5-field cron expression in
@@ -89,11 +91,11 @@ pub use execution_guard::{
 };
 pub use guarded_runner::{GuardedRunResult, GuardedRunner};
 pub use model::{
-    CronSchedule, GroupedIntervalSchedule, IntervalWindow, Job, JobFuture, JobResult, JobState,
-    JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord, RunSkipReason,
-    RunStatus, Schedule, SchedulerConfig, SchedulerReport, StaggeredIntervalSchedule, Task,
-    TaskContext, TerminalStatePolicy, TimeWindowAlignment, TimeWindowSegment, TriggerSource,
-    TriggeredTaskContext, WindowedIntervalSchedule,
+    CronSchedule, GroupedCronSchedule, GroupedIntervalSchedule, IntervalWindow, Job, JobFuture,
+    JobResult, JobState, JobTimeWindow, MissedRunPolicy, OverlapPolicy, RunContext, RunRecord,
+    RunSkipReason, RunStatus, Schedule, SchedulerConfig, SchedulerReport,
+    StaggeredIntervalSchedule, Task, TaskContext, TerminalStatePolicy, TimeWindowAlignment,
+    TimeWindowSegment, TriggerSource, TriggeredTaskContext, WindowedIntervalSchedule,
 };
 pub use observer::{
     LogObserver, NoopObserver, PauseScope, SchedulerEvent, SchedulerObserver, SchedulerStopReason,

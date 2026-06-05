@@ -46,6 +46,38 @@ impl GroupedIntervalSchedule {
     }
 }
 
+/// Cron schedule that spreads members evenly inside a post-anchor window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedCronSchedule {
+    pub cron: CronSchedule,
+    pub spread: Duration,
+    pub group_size: u32,
+    pub member_index: u32,
+    pub group_seed: Option<String>,
+}
+
+impl GroupedCronSchedule {
+    pub fn new(
+        cron: CronSchedule,
+        spread: Duration,
+        group_size: u32,
+        member_index: u32,
+    ) -> Self {
+        Self {
+            cron,
+            spread,
+            group_size,
+            member_index,
+            group_seed: None,
+        }
+    }
+
+    pub fn with_group_seed(mut self, group_seed: impl Into<String>) -> Self {
+        self.group_seed = Some(group_seed.into());
+        self
+    }
+}
+
 /// Interval override for a matching time window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntervalWindow {
@@ -99,6 +131,13 @@ pub enum Schedule {
     /// index. An optional group seed can rotate the entire group without
     /// changing the spacing between members.
     GroupedInterval(GroupedIntervalSchedule),
+    /// Trigger using a cron anchor and spread members inside each anchor
+    /// window.
+    ///
+    /// Each 5-field cron match becomes an anchor. The scheduler assigns each
+    /// member a stable slot inside `spread`, then repeats that slot on every
+    /// subsequent anchor.
+    GroupedCron(GroupedCronSchedule),
     /// Trigger repeatedly with frequencies selected by local time windows.
     WindowedInterval(WindowedIntervalSchedule),
     /// Trigger at the listed wall-clock times.
@@ -199,6 +238,36 @@ impl Schedule {
     ) -> Self {
         Self::GroupedInterval(
             GroupedIntervalSchedule::new(every, group_size, member_index)
+                .with_group_seed(group_seed),
+        )
+    }
+
+    /// Create a grouped cron schedule with evenly spaced members.
+    pub fn grouped_cron(
+        cron: CronSchedule,
+        spread: Duration,
+        group_size: u32,
+        member_index: u32,
+    ) -> Self {
+        Self::GroupedCron(GroupedCronSchedule::new(
+            cron,
+            spread,
+            group_size,
+            member_index,
+        ))
+    }
+
+    /// Create a grouped cron schedule and rotate the whole group with an
+    /// explicit seed.
+    pub fn grouped_cron_with_seed(
+        cron: CronSchedule,
+        spread: Duration,
+        group_size: u32,
+        member_index: u32,
+        group_seed: impl Into<String>,
+    ) -> Self {
+        Self::GroupedCron(
+            GroupedCronSchedule::new(cron, spread, group_size, member_index)
                 .with_group_seed(group_seed),
         )
     }

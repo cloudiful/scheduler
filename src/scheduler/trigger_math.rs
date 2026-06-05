@@ -41,6 +41,9 @@ pub(crate) fn initial_next_run_at<D>(
         Schedule::GroupedInterval(grouped) => {
             super::interval_phase::grouped_initial_next_run_at(Utc::now(), grouped).map(Some)
         }
+        Schedule::GroupedCron(grouped) => {
+            super::grouped_cron::initial_next_run_at(Utc::now(), grouped, timezone).map(Some)
+        }
         Schedule::WindowedInterval(windowed) => {
             super::windowed_interval::next_after(Utc::now(), windowed, timezone)
         }
@@ -172,6 +175,9 @@ where
             let delta = duration_to_delta(grouped.every)
                 .ok_or_else(SchedulerError::invalid_interval_out_of_range)?;
             Ok(scheduled_at.checked_add_signed(delta))
+        }
+        Schedule::GroupedCron(grouped) => {
+            super::grouped_cron::next_after(scheduled_at, grouped, timezone)
         }
         Schedule::WindowedInterval(windowed) => {
             super::windowed_interval::next_after(scheduled_at, windowed, timezone)
