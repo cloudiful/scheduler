@@ -1,6 +1,6 @@
 [package]
 name = "cloudiful-scheduler"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 license = "Apache-2.0"
 description = "Single-job async scheduling library for background work with optional Valkey-backed state."
@@ -24,11 +24,11 @@ valkey-guard = ["dep:redis"]
 valkey-store = ["dep:redis", "dep:serde", "dep:serde_json"]
 
 [dependencies]
-chrono = {version = "0.4.44", features = ["serde"]}
+chrono = {version = "0.4.45", features = ["serde"]}
 chrono-tz = "0.10.4"
 cron = "0.16.0"
-log = "0.4.29"
+log = "0.4.32"
 tokio = { version = "1.52.3", features = [ "macros", "rt", "rt-multi-thread", "sync", "time" ] }
-redis = { version = "1.2.1", optional = true, features = [ "tokio-comp", "connection-manager" ] }
+redis = { version = "1.2.2", optional = true, features = [ "tokio-comp", "connection-manager" ] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
